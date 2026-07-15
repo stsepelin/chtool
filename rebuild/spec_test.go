@@ -41,6 +41,30 @@ func TestNewDDLForV2ErrorsWithoutCreate(t *testing.T) {
 	}
 }
 
+func TestSpecMVDDLChangesHashAndReadsBack(t *testing.T) {
+	s := (&Spec{Name: "n", TargetTable: "t"}).SetNewDDL("CREATE TABLE t (x UInt8) ENGINE = MergeTree ORDER BY x")
+	before := s.Hash()
+	s.SetMVDDL("mv1", "CREATE MATERIALIZED VIEW mv1 TO t (x UInt8) AS SELECT x FROM s GROUP BY x")
+	if s.Hash() == before {
+		t.Fatal("hash should change when a new MV definition is supplied")
+	}
+	if s.newMVDDL("mv1") == "" {
+		t.Fatal("newMVDDL should return the supplied definition")
+	}
+	if s.newMVDDL("absent") != "" {
+		t.Fatal("newMVDDL should be empty for an MV without a new definition")
+	}
+}
+
+func TestSpecValidateRejectsUnknownNewMV(t *testing.T) {
+	s := &Spec{Name: "n", TargetTable: "t", BoundaryColumn: "created_at", MVs: []string{"mv"}}
+	s.SetNewDDL("CREATE TABLE t (x UInt8) ENGINE = MergeTree ORDER BY x")
+	s.SetMVDDL("not_listed", "CREATE MATERIALIZED VIEW not_listed TO t (x UInt8) AS SELECT x FROM s GROUP BY x")
+	if err := s.validate(); err == nil {
+		t.Fatal("validate should reject a new_mvs entry not present in spec.mvs")
+	}
+}
+
 func TestChunkColumnDefault(t *testing.T) {
 	if (&Spec{}).chunkColumn() != "date" {
 		t.Fatal("default chunk column should be date")

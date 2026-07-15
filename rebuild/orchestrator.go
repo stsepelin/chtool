@@ -65,13 +65,39 @@ func (o *Orchestrator) v2MVName(mv string) string { return mv + "_v2" }
 func (o *Orchestrator) mvs(ctx context.Context) ([]*MV, error) {
 	var out []*MV
 	for _, name := range o.Spec.MVs {
-		mv, err := FetchMV(ctx, o.Conn, o.DB, name)
+		var (
+			mv  *MV
+			err error
+		)
+		if ddl := o.Spec.newMVDDL(name); ddl != "" {
+			// Operator-supplied new definition: used to arm, backfill, and (at
+			// cutover) recreate this MV, so a sourced column can enter the
+			// aggregate. Its parsed name must match the spec entry.
+			if mv, err = parseMV(ddl); err == nil && mv.Name != name {
+				err = fmt.Errorf("new_mvs[%q] declares a different MV name %q", name, mv.Name)
+			}
+		} else {
+			mv, err = FetchMV(ctx, o.Conn, o.DB, name)
+		}
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, mv)
 	}
 	return out, nil
+}
+
+// preflightMVs verifies each MV's SELECT resolves against its live source before
+// any mutation, turning a missing source column into an actionable up-front error.
+func (o *Orchestrator) preflightMVs(ctx context.Context, mvs []*MV) error {
+	o.logf("phase: preflight — resolving %d MV definition(s) against their sources", len(mvs))
+	for _, m := range mvs {
+		if err := o.Conn.Exec(ctx, m.ResolveProbeSQL(o.Spec.BoundaryColumn)); err != nil {
+			return fmt.Errorf("mv %s: SELECT does not resolve against source %s — add the new column(s) to the source table before running: %w",
+				m.Name, m.SourceName(), err)
+		}
+	}
+	return nil
 }
 
 func distinctSources(mvs []*MV) []string {
@@ -97,12 +123,30 @@ func (o *Orchestrator) record(ctx context.Context, phase, status, cursor, detail
 // resumable: completed backfill chunks are skipped and the boundary T is read
 // back from the state store. Cutover is a separate, explicit command.
 func (o *Orchestrator) Run(ctx context.Context, opts Options) error {
+	// Validate the spec on use, so a programmatically-built spec (SetNewDDL /
+	// SetMVDDL, which don't validate) is checked too — e.g. a new_mvs entry naming
+	// an MV not in spec.mvs would otherwise be silently ignored.
+	if err := o.Spec.validate(); err != nil {
+		return err
+	}
 	opts = opts.withDefaults()
 	recs, err := o.Store.Records(ctx, o.Spec.OpID())
 	if err != nil {
 		return err
 	}
 	if err := o.guardSpecUnchanged(recs); err != nil {
+		return err
+	}
+
+	// 0. preflight: the MV definitions must resolve against their sources before
+	// anything is mutated, so a missing source column (the source table not yet
+	// ALTERed to add a new dimension) fails cleanly rather than half-building the
+	// rebuild.
+	mvs, err := o.mvs(ctx)
+	if err != nil {
+		return err
+	}
+	if err := o.preflightMVs(ctx, mvs); err != nil {
 		return err
 	}
 
@@ -131,10 +175,6 @@ func (o *Orchestrator) Run(ctx context.Context, opts Options) error {
 		}
 	}
 	o.logf("phase: dual-write, boundary T = %s (armed MVs capture %s >= T)", t.UTC().Format(tsLayout), o.Spec.BoundaryColumn)
-	mvs, err := o.mvs(ctx)
-	if err != nil {
-		return err
-	}
 	for _, m := range mvs {
 		sql := m.V2CreateSQL(o.DB, o.v2MVName(m.Name), o.DB+"."+o.Spec.V2Table(), o.Spec.BoundaryColumn, t)
 		sql = strings.Replace(sql, "CREATE MATERIALIZED VIEW", "CREATE MATERIALIZED VIEW IF NOT EXISTS", 1)

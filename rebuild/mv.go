@@ -126,6 +126,15 @@ func (m *MV) CountSQL(boundaryCol, chunkCol, chunkVal string, t time.Time) strin
 		m.Source, boundaryPred(boundaryCol, t, false), chunkCol, esc(chunkVal))
 }
 
+// ResolveProbeSQL is a zero-row (WHERE 1 = 0) probe that resolves the MV's
+// projection, GROUP BY, and boundary column against its source without scanning.
+// It fails when a referenced column is missing — e.g. the source table has not
+// yet been ALTERed to add a new sourced dimension.
+func (m *MV) ResolveProbeSQL(boundaryCol string) string {
+	return fmt.Sprintf("SELECT %s, min(%s) FROM %s WHERE 1 = 0 GROUP BY %s FORMAT Null",
+		m.Projection, boundaryCol, m.Source, m.GroupBy)
+}
+
 // SelectForProbe renders the aggregation SELECT for a chunk with FORMAT Null.
 func (m *MV) SelectForProbe(boundaryCol string, t time.Time, chunkPred, settingsClause string) string {
 	where := boundaryPred(boundaryCol, t, false)

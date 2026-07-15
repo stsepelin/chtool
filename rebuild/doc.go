@@ -1,16 +1,21 @@
 // Package rebuild performs online rebuilds of ClickHouse AggregatingMergeTree
-// tables — an ORDER BY change or a materialized-view re-point — while ingestion
-// continues, with no data loss and no double-counting.
+// tables — an ORDER BY change, a materialized-view re-point, or adding a sourced
+// column to the aggregate — while ingestion continues, with no data loss and no
+// double-counting.
 //
 // ALTER TABLE … MODIFY ORDER BY is metadata-only and never re-sorts existing
 // data, so any real key change means building a new table and backfilling it.
 // Doing that on a live table without losing or double-counting in-flight events
 // is fiddly; this package encodes a correct, resumable procedure:
 //
+//  0. preflight: resolve each MV's SELECT against its source (a zero-row probe)
+//     before any mutation, so a missing source column fails fast;
 //  1. create the new table (v2) from the spec's DDL;
 //  2. arm copies of the feeding materialized views at a near-future boundary T
 //     (they capture events with created_at >= T), derived from the live
-//     SHOW CREATE so their SELECT is never hand-duplicated;
+//     SHOW CREATE so their SELECT is never hand-duplicated — or from new
+//     definitions the spec supplies (Spec.SetMVDDL / new_mvs) when the MV
+//     projection itself changes, e.g. adding a sourced GROUP BY column;
 //  3. wait past T, then lag-drain (the count of pre-T rows must go quiet);
 //  4. backfill history (created_at < T) — the exact complement of the MVs —
 //     newest-partition first, split into memory-bounded hash-bucket chunks,

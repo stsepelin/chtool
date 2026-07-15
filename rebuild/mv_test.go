@@ -30,6 +30,16 @@ func TestParseMVRejectsWhere(t *testing.T) {
 	}
 }
 
+func TestResolveProbeSQLIsZeroRow(t *testing.T) {
+	m, _ := parseMV(sampleMV)
+	q := m.ResolveProbeSQL("created_at")
+	for _, want := range []string{"WHERE 1 = 0", "GROUP BY user_id, ids", "FROM default.views", "min(created_at)", "FORMAT Null"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("probe missing %q: %s", want, q)
+		}
+	}
+}
+
 func TestSplitTopLevelIgnoresNestedCommas(t *testing.T) {
 	if parts := splitTopLevel("a UInt64, b Decimal(38, 6), c SimpleAggregateFunction(sum, UInt64)"); len(parts) != 3 {
 		t.Fatalf("expected 3 columns, got %d: %v", len(parts), parts)

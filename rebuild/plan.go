@@ -12,6 +12,9 @@ import (
 // forceVersion), a size estimate, the server-adapted backfill tuning, and a
 // FORMAT Null cost probe on one representative chunk. It mutates nothing.
 func Plan(ctx context.Context, o *Orchestrator, forceVersion bool) error {
+	if err := o.Spec.validate(); err != nil {
+		return err
+	}
 	o.logf("Rebuild plan: %s (target %s → %s)", o.Spec.Name, o.Spec.TargetTable, o.Spec.V2Table())
 
 	ver, err := o.scalarString(ctx, "SELECT version()")
@@ -30,6 +33,9 @@ func Plan(ctx context.Context, o *Orchestrator, forceVersion bool) error {
 
 	mvs, err := o.mvs(ctx)
 	if err != nil {
+		return err
+	}
+	if err := o.preflightMVs(ctx, mvs); err != nil {
 		return err
 	}
 	sources := distinctSources(mvs)

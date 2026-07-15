@@ -195,12 +195,58 @@ func TestCutoverReconcileGuardBlocks(t *testing.T) {
 	}
 }
 
+// A programmatically-built spec is validated on use: a SetMVDDL naming an MV not
+// in spec.mvs (a typo) must be rejected, not silently fall back to the live MV.
+func TestRunValidatesSpecNewMVs(t *testing.T) {
+	o := newOrch(&fakeStore{}, &fakeConn{})
+	o.Spec.SetMVDDL("events_daily_mv_typo",
+		"CREATE MATERIALIZED VIEW events_daily_mv_typo TO analytics.events_daily (x UInt8) AS SELECT x FROM analytics.events GROUP BY x")
+	err := o.Run(context.Background(), Options{})
+	if err == nil || !strings.Contains(err.Error(), "not in spec.mvs") {
+		t.Fatalf("Run must reject a new_mvs entry not in spec.mvs, got %v", err)
+	}
+}
+
 func TestRunRefusesChangedSpec(t *testing.T) {
 	store := &fakeStore{recs: []Record{{OpID: "rebuild:reorder", SpecHash: "OLDHASH", Phase: phaseCreated}}}
 	o := newOrch(store, &fakeConn{})
 	err := o.Run(context.Background(), Options{})
 	if err == nil || !strings.Contains(err.Error(), "spec changed") {
 		t.Fatalf("Run must refuse a changed spec, got %v", err)
+	}
+}
+
+// When a new MV definition is supplied, mvs() must use it (adding a sourced
+// dimension) instead of the live one, and reject a name mismatch.
+func TestMVsUsesNewDefinitionOverLive(t *testing.T) {
+	o := newOrch(&fakeStore{}, &fakeConn{})
+	o.Spec.SetMVDDL("events_daily_mv",
+		"CREATE MATERIALIZED VIEW events_daily_mv TO analytics.events_daily (date Date, country String, tier UInt8, hits UInt64) "+
+			"AS SELECT date, country, tier, sum(hits) AS hits FROM analytics.events GROUP BY date, country, tier")
+	mvs, err := o.mvs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *MV
+	for _, m := range mvs {
+		if m.Name == "events_daily_mv" {
+			got = m
+		}
+	}
+	if got == nil {
+		t.Fatal("events_daily_mv not returned")
+	}
+	if !strings.Contains(got.GroupBy, "tier") {
+		t.Fatalf("mvs() should use the new definition (GROUP BY … tier), got %q", got.GroupBy)
+	}
+}
+
+func TestMVsRejectsMismatchedNewDefName(t *testing.T) {
+	o := newOrch(&fakeStore{}, &fakeConn{})
+	o.Spec.SetMVDDL("events_daily_mv",
+		"CREATE MATERIALIZED VIEW wrong_name TO analytics.events_daily (x UInt8) AS SELECT x FROM analytics.events GROUP BY x")
+	if _, err := o.mvs(context.Background()); err == nil {
+		t.Fatal("mvs() should reject a new definition whose name mismatches the spec entry")
 	}
 }
 

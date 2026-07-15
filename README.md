@@ -311,6 +311,8 @@ mvs:                             # the materialized views feeding the target
 validations:                     # aggregates compared old-vs-new; a mismatch fails
   - sum(hits)
   - sum(revenue)
+# new_mvs:                             # optional: supply new MV definitions (see below)
+#   events_daily_mv: events_daily_mv.sql
 # companion_migration: 000042_reorder   # optional metadata for your ReconcileGuard
 # dress_rehearsal_version: 24.8.1        # Plan refuses a different server version unless forced
 backfill:                        # all optional — server-adapted defaults otherwise
@@ -319,6 +321,38 @@ backfill:                        # all optional — server-adapted defaults othe
   max_buckets: 256
   # rate_limit_bytes_per_sec, max_execution_time, bucket_key
 ```
+
+### Changing the MVs (adding a sourced column)
+
+By default the rebuilder re-emits each feeding MV **verbatim** from its live
+definition — it automates key/DDL changes (reorder the `ORDER BY`, change engine
+settings, add a `DEFAULT`/`MATERIALIZED` column) while the MV projection stays the
+same.
+
+To also change what the MVs produce — e.g. add a **sourced** dimension to the
+aggregate (a new column added to the source tables *and* to each MV's `SELECT` /
+`GROUP BY`, which changes the aggregation grain) — give the spec the **new MV
+definitions** via `new_mvs`. The rebuilder then arms, backfills, and (at cutover)
+recreates those MVs from the new definitions, so the new key **and** the new MVs
+swap in atomically. The historical backfill re-aggregates at the new grain;
+measure totals are invariant under a finer `GROUP BY`, so `sum(...)` validations
+still hold exactly.
+
+```go
+spec.SetNewDDL(newTargetDDL)               // v2 target: new column + new ORDER BY
+spec.SetMVDDL("raw_web_mv", newWebMVDDL)    // MV SELECT/GROUP BY now includes the column
+spec.SetMVDDL("raw_mobile_mv", newMobileMV) // ...one per feeding MV
+```
+
+Author each new MV for the real target/MV names with no `WHERE` (the boundary is
+added), and add the column to the source tables before running. MVs without a
+`new_mvs` entry keep their live definition.
+
+chtool migrates the *aggregate*, not the raw tables — so the source `ALTER` is
+yours to do first. To keep that boundary safe, `Plan` and `Run` **preflight**
+every MV: each definition's `SELECT` is resolved against its live source (a
+zero-row probe) before anything is created or armed, so a missing source column
+fails fast with an actionable error instead of half-building the rebuild.
 
 ### Memory-safe backfill
 

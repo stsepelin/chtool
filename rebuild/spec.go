@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -32,6 +34,14 @@ type Spec struct {
 	ChunkColumn string `yaml:"chunk_column"`
 	// MVs are the materialized views that feed the target.
 	MVs []string `yaml:"mvs"`
+	// NewMVFiles optionally maps an MV name to a file holding its NEW definition
+	// — the way to add a sourced dimension (extra SELECT/GROUP BY column) as part
+	// of the rebuild. When set for an MV, the rebuilder arms, backfills, and (at
+	// cutover) recreates that MV from the new definition instead of its live one;
+	// unset MVs use their live definition. Author each for the real target/MV
+	// names with no WHERE (the boundary predicate is added), and add the new
+	// column to the source table before running.
+	NewMVFiles map[string]string `yaml:"new_mvs"`
 	// Validations are aggregate expressions compared old-vs-new (e.g.
 	// "sum(views)"); a mismatch fails the rebuild.
 	Validations []string `yaml:"validations"`
@@ -45,6 +55,7 @@ type Spec struct {
 	Backfill BackfillConfig `yaml:"backfill"`
 
 	newDDL string
+	newMVs map[string]string // mv name -> new definition DDL
 	hash   string
 }
 
@@ -63,7 +74,17 @@ func LoadSpec(dir string) (*Spec, error) {
 		return nil, fmt.Errorf("read new_ddl %s: %w", s.NewDDLFile, err)
 	}
 	s.newDDL = string(ddl)
-	s.hash = hashBytes(raw, ddl)
+	for name, file := range s.NewMVFiles {
+		mvDDL, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			return nil, fmt.Errorf("read new_mv %s (%s): %w", name, file, err)
+		}
+		if s.newMVs == nil {
+			s.newMVs = map[string]string{}
+		}
+		s.newMVs[name] = string(mvDDL)
+	}
+	s.hash = s.sumHash(raw)
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -74,14 +95,41 @@ func LoadSpec(dir string) (*Spec, error) {
 // recomputes the content hash. Returns the spec for chaining.
 func (s *Spec) SetNewDDL(ddl string) *Spec {
 	s.newDDL = ddl
-	s.hash = hashBytes([]byte(s.Name+s.TargetTable), []byte(ddl))
+	s.hash = s.sumHash([]byte(s.Name + "\x00" + s.TargetTable))
 	return s
 }
 
-func hashBytes(a, b []byte) string {
-	sum := sha256.Sum256(append(append([]byte{}, a...), b...))
-	return hex.EncodeToString(sum[:])
+// SetMVDDL supplies the new definition for one feeding MV (see NewMVFiles) on a
+// programmatically-built Spec and recomputes the content hash. Returns the spec
+// for chaining.
+func (s *Spec) SetMVDDL(name, ddl string) *Spec {
+	if s.newMVs == nil {
+		s.newMVs = map[string]string{}
+	}
+	s.newMVs[name] = ddl
+	s.hash = s.sumHash([]byte(s.Name + "\x00" + s.TargetTable))
+	return s
 }
+
+// sumHash hashes the spec's content — a caller-chosen base plus the new target
+// DDL and any new MV DDLs (in name order) — so a change to any of them is
+// detected by guardSpecUnchanged.
+func (s *Spec) sumHash(base []byte) string {
+	h := sha256.New()
+	h.Write(base)
+	h.Write([]byte{0})
+	h.Write([]byte(s.newDDL))
+	for _, name := range slices.Sorted(maps.Keys(s.newMVs)) {
+		h.Write([]byte{0})
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write([]byte(s.newMVs[name]))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// newMVDDL returns the operator-supplied new definition for mv, or "" if none.
+func (s *Spec) newMVDDL(mv string) string { return s.newMVs[mv] }
 
 func (s *Spec) validate() error {
 	switch {
@@ -95,6 +143,11 @@ func (s *Spec) validate() error {
 		return fmt.Errorf("spec.boundary_column is required")
 	case len(s.MVs) == 0:
 		return fmt.Errorf("spec.mvs must list the materialized views feeding the target")
+	}
+	for name := range s.newMVs {
+		if !slices.Contains(s.MVs, name) {
+			return fmt.Errorf("new_mvs names %q, which is not in spec.mvs", name)
+		}
 	}
 	return nil
 }
