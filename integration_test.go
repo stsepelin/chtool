@@ -1,0 +1,42 @@
+//go:build integration
+
+// Integration tests run against a real ClickHouse. They are excluded from the
+// default build and run with:
+//
+//	go test -tags integration ./...
+//
+// The server is taken from CHTOOL_TEST_DSN (default clickhouse://localhost:9000/
+// default); tests skip if it is unreachable.
+package chtool
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+)
+
+func itDSN() string {
+	if d := os.Getenv("CHTOOL_TEST_DSN"); d != "" {
+		return d
+	}
+	return "clickhouse://localhost:9000/default"
+}
+
+func TestIntegrationOpenAndPing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := Open(ctx, itDSN())
+	if err != nil {
+		t.Skipf("no ClickHouse at %s: %v", itDSN(), err)
+	}
+	defer conn.Close()
+
+	var v string
+	if err := conn.QueryRow(ctx, "SELECT version()").Scan(&v); err != nil {
+		t.Fatalf("query version: %v", err)
+	}
+	if v == "" {
+		t.Fatal("empty server version")
+	}
+}
