@@ -2,7 +2,6 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/stsepelin/chtool.svg)](https://pkg.go.dev/github.com/stsepelin/chtool)
 [![CI](https://github.com/stsepelin/chtool/actions/workflows/ci.yml/badge.svg)](https://github.com/stsepelin/chtool/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/stsepelin/chtool)](https://goreportcard.com/report/github.com/stsepelin/chtool)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A small, dependency-light **ClickHouse operations toolkit for Go**, built on
