@@ -381,7 +381,9 @@ func TestIntegrationWideKeyReorderAddColumnTwoSources(t *testing.T) {
 	dimCols := "date Date, country LowCardinality(String), device LowCardinality(String), os LowCardinality(String), " +
 		"browser LowCardinality(String), channel LowCardinality(String), campaign_id UInt32, placement_id UInt32, " +
 		"creative_id UInt32, ab_variant UInt8"
-	aggCols := dims + ", impressions, clicks, spend"
+	// The MV's TO column list needs types (older ClickHouse requires them); the
+	// measures carry the SELECT output types (sum(Decimal(18,6)) widens to (38,6)).
+	aggCols := dimCols + ", impressions UInt64, clicks UInt64, spend Decimal(38, 6)"
 
 	if err := conn.Exec(ctx, "CREATE TABLE "+db+".events_agg ("+dimCols+", "+measures+
 		") ENGINE = AggregatingMergeTree ORDER BY ("+dims+")"); err != nil {
@@ -527,7 +529,7 @@ func TestIntegrationAddSourcedColumnTwoSources(t *testing.T) {
 			t.Fatalf("create %s: %v", src, err)
 		}
 		// Live MV: keyed on (date, country) only — tier is ignored for now.
-		if err := conn.Exec(ctx, "CREATE MATERIALIZED VIEW "+db+"."+src+"_mv TO "+db+".events_agg (date, country, hits) "+
+		if err := conn.Exec(ctx, "CREATE MATERIALIZED VIEW "+db+"."+src+"_mv TO "+db+".events_agg (date Date, country LowCardinality(String), hits UInt64) "+
 			"AS SELECT date, country, sum(hits) AS hits FROM "+db+"."+src+" GROUP BY date, country"); err != nil {
 			t.Fatalf("create %s_mv: %v", src, err)
 		}
@@ -552,7 +554,7 @@ func TestIntegrationAddSourcedColumnTwoSources(t *testing.T) {
 	spec.SetNewDDL("CREATE TABLE events_agg (date Date, country LowCardinality(String), tier UInt8, " +
 		"hits SimpleAggregateFunction(sum, UInt64)) ENGINE = AggregatingMergeTree ORDER BY (date, country, tier)")
 	for _, src := range []string{"raw_web", "raw_mobile"} {
-		spec.SetMVDDL(src+"_mv", "CREATE MATERIALIZED VIEW "+src+"_mv TO events_agg (date, country, tier, hits) "+
+		spec.SetMVDDL(src+"_mv", "CREATE MATERIALIZED VIEW "+src+"_mv TO events_agg (date Date, country LowCardinality(String), tier UInt8, hits UInt64) "+
 			"AS SELECT date, country, tier, sum(hits) AS hits FROM "+src+" GROUP BY date, country, tier")
 	}
 
@@ -623,7 +625,7 @@ func TestIntegrationPreflightMissingSourceColumn(t *testing.T) {
 		// Note: raw has NO `tier` column — the operator forgot to ALTER it.
 		"CREATE TABLE " + db + ".raw (created_at DateTime, date Date, country String, hits UInt64) ENGINE = MergeTree ORDER BY created_at",
 		"CREATE TABLE " + db + ".agg (date Date, country String, hits SimpleAggregateFunction(sum, UInt64)) ENGINE = AggregatingMergeTree ORDER BY (date, country)",
-		"CREATE MATERIALIZED VIEW " + db + ".raw_mv TO " + db + ".agg (date, country, hits) AS SELECT date, country, sum(hits) AS hits FROM " + db + ".raw GROUP BY date, country",
+		"CREATE MATERIALIZED VIEW " + db + ".raw_mv TO " + db + ".agg (date Date, country String, hits UInt64) AS SELECT date, country, sum(hits) AS hits FROM " + db + ".raw GROUP BY date, country",
 	}
 	for _, s := range setup {
 		if err := conn.Exec(ctx, s); err != nil {
@@ -637,7 +639,7 @@ func TestIntegrationPreflightMissingSourceColumn(t *testing.T) {
 	}
 	spec.SetNewDDL("CREATE TABLE agg (date Date, country String, tier UInt8, hits SimpleAggregateFunction(sum, UInt64)) ENGINE = AggregatingMergeTree ORDER BY (date, country, tier)")
 	// New MV references `tier`, which raw does not have.
-	spec.SetMVDDL("raw_mv", "CREATE MATERIALIZED VIEW raw_mv TO agg (date, country, tier, hits) AS SELECT date, country, tier, sum(hits) AS hits FROM raw GROUP BY date, country, tier")
+	spec.SetMVDDL("raw_mv", "CREATE MATERIALIZED VIEW raw_mv TO agg (date Date, country String, tier UInt8, hits UInt64) AS SELECT date, country, tier, sum(hits) AS hits FROM raw GROUP BY date, country, tier")
 
 	o := &Orchestrator{Conn: conn, DB: db, Spec: spec, Store: NewSQLStore(conn, db+"._chtool_ops")}
 	err := o.Run(ctx, Options{BoundaryOffset: 2 * time.Second, LagPoll: 500 * time.Millisecond})
