@@ -1,0 +1,16 @@
+# Example: change the ORDER BY of an events_daily aggregate fed by one MV from a
+# raw `events` table. Totals are ORDER-BY-independent, so the old-vs-new
+# validation still matches exactly.
+name: events-daily-neworder
+target_table: events_daily
+new_ddl: new_ddl.sql
+boundary_column: created_at
+chunk_column: date
+mvs:
+  - events_daily_mv
+validations:
+  - sum(hits)
+  - sum(revenue)
+backfill:
+  target_rows_per_chunk: 50000000
+  memory_fraction: 0.3
