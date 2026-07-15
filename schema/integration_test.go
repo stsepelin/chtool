@@ -24,13 +24,21 @@ func baseDSN() string {
 	return "clickhouse://localhost:9000/default"
 }
 
+func requireCHOrSkip(t *testing.T, err error) {
+	t.Helper()
+	if os.Getenv("CHTOOL_REQUIRE_CH") != "" {
+		t.Fatalf("ClickHouse required (CHTOOL_REQUIRE_CH) but unreachable at %s: %v", baseDSN(), err)
+	}
+	t.Skipf("no ClickHouse at %s: %v", baseDSN(), err)
+}
+
 func scratchConn(t *testing.T, db string) (Conn, func()) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := chtool.Open(ctx, baseDSN())
 	if err != nil {
-		t.Skipf("no ClickHouse at %s: %v", baseDSN(), err)
+		requireCHOrSkip(t, err)
 	}
 	for _, q := range []string{"DROP DATABASE IF EXISTS " + db, "CREATE DATABASE " + db} {
 		if err := conn.Exec(ctx, q); err != nil {

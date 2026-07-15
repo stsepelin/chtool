@@ -34,6 +34,9 @@ func scratchDB(t *testing.T, name string) (dsn string, cleanup func()) {
 	defer cancel()
 	admin, err := chtool.Open(ctx, baseDSN())
 	if err != nil {
+		if os.Getenv("CHTOOL_REQUIRE_CH") != "" {
+			t.Fatalf("ClickHouse required (CHTOOL_REQUIRE_CH) but unreachable at %s: %v", baseDSN(), err)
+		}
 		t.Skipf("no ClickHouse at %s: %v", baseDSN(), err)
 	}
 	for _, q := range []string{"DROP DATABASE IF EXISTS " + name, "CREATE DATABASE " + name} {

@@ -28,6 +28,9 @@ func TestIntegrationOpenAndPing(t *testing.T) {
 	defer cancel()
 	conn, err := Open(ctx, itDSN())
 	if err != nil {
+		if os.Getenv("CHTOOL_REQUIRE_CH") != "" {
+			t.Fatalf("ClickHouse required (CHTOOL_REQUIRE_CH) but unreachable at %s: %v", itDSN(), err)
+		}
 		t.Skipf("no ClickHouse at %s: %v", itDSN(), err)
 	}
 	defer conn.Close()
