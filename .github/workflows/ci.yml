@@ -18,8 +18,8 @@ jobs:
     name: Lint & format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           check-latest: true
@@ -40,8 +40,8 @@ jobs:
     name: Build & unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           check-latest: true
@@ -56,7 +56,7 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - name: Upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
@@ -81,8 +81,8 @@ jobs:
     env:
       CHTOOL_TEST_DSN: clickhouse://localhost:9000/default
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           check-latest: true
@@ -93,12 +93,12 @@ jobs:
     name: Vulnerability scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Scan on the latest patched Go, not the go.mod floor: govulncheck reports
       # standard-library CVEs against the running toolchain, and a library's
       # stdlib version is the consumer's build concern. This keeps the gate on
       # what this repo controls — vulnerable dependencies and unpatched CVEs.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
       - name: govulncheck
