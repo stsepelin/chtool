@@ -167,12 +167,15 @@ for _, i := range issues {
 }
 ```
 
-**Normalization.** `Normalize` (used by `Dump`) rewrites a raw `create_table_query`
-into a canonical form: Cloud `Shared*`/`Replicated*` engines are mapped to their
-OSS equivalents (keeping semantic args like a `ReplacingMergeTree` version
-column), the default `index_granularity = 8192` is stripped, and the DDL is
-reflowed by clause. The upshot: **a Cloud dump and an OSS dump of the same logical
-schema compare equal.**
+**Normalization.** `Dump` normalizes each object via `NormalizeForDB` (which layers
+a database-qualifier strip on top of `Normalize`): Cloud `Shared*`/`Replicated*`
+engines are mapped to their OSS equivalents (keeping semantic args like a
+`ReplacingMergeTree` version column), the default `index_granularity = 8192` is
+stripped, the DDL is reflowed by clause, and the `<db>.` qualifier is removed from
+the CREATE target and an MV's `TO`/`FROM`. The upshot: **a dump compares equal
+across Cloud vs OSS *and* across databases of different names** — e.g. a snapshot
+taken from `default` shows no drift against a live `smoke` database. Use
+`Normalize(ddl)` directly when the database qualifier is meaningful.
 
 **Lint rules.** `Lint` checks that filenames match the sequence pattern and form a
 gapless run; that every sequence has an `.up` file; that no file uses

@@ -5,6 +5,51 @@ import (
 	"testing"
 )
 
+// A schema dumped from one database must compare equal to the same schema in a
+// differently named database: NormalizeForDB strips the db qualifier from the
+// CREATE target and an MV's TO/FROM references.
+func TestNormalizeForDBIsDBAgnostic(t *testing.T) {
+	tableFor := func(db string) string {
+		return "CREATE TABLE " + db + ".bids (`id` UInt64, `amount` Decimal(14, 6)) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192"
+	}
+	if NormalizeForDB(tableFor("default"), "default") != NormalizeForDB(tableFor("smoke"), "smoke") {
+		t.Fatalf("table drift is db-name-bound:\n%q\n%q",
+			NormalizeForDB(tableFor("default"), "default"), NormalizeForDB(tableFor("smoke"), "smoke"))
+	}
+
+	mvFor := func(db string) string {
+		return "CREATE MATERIALIZED VIEW " + db + ".bids_mv TO " + db + ".bids_agg (`id` UInt64, `n` UInt64) AS SELECT id, count() AS n FROM " + db + ".bids GROUP BY id"
+	}
+	da, sm := NormalizeForDB(mvFor("default"), "default"), NormalizeForDB(mvFor("smoke"), "smoke")
+	if da != sm {
+		t.Fatalf("MV drift is db-name-bound:\n%q\n%q", da, sm)
+	}
+	// The qualifier must actually be gone (target, TO, and FROM).
+	for _, banned := range []string{"default.", "smoke."} {
+		if strings.Contains(da, banned) {
+			t.Fatalf("qualifier %q not stripped: %q", banned, da)
+		}
+	}
+
+	// Backtick-quoted qualifier is handled too.
+	q := NormalizeForDB("CREATE TABLE `default`.`bids` (`id` UInt64) ENGINE = MergeTree ORDER BY id", "default")
+	if strings.Contains(q, "default") {
+		t.Fatalf("backtick-quoted qualifier not stripped: %q", q)
+	}
+}
+
+// Stripping is scoped to the exact db name; a same-prefixed identifier
+// (e.g. a column) must not be clobbered.
+func TestNormalizeForDBDoesNotClobberSimilarNames(t *testing.T) {
+	out := NormalizeForDB("CREATE TABLE default.t (`default_flag` UInt8) ENGINE = MergeTree ORDER BY default_flag", "default")
+	if !strings.Contains(out, "default_flag") {
+		t.Fatalf("column default_flag was clobbered: %q", out)
+	}
+	if strings.Contains(out, "default.t") {
+		t.Fatalf("qualifier not stripped: %q", out)
+	}
+}
+
 // index_granularity = 8192 in the MIDDLE of a settings list must not leave a
 // dangling comma (regression for the "SETTINGS, ..." corruption).
 func TestNormalizeStripsGranularityMidList(t *testing.T) {

@@ -2,7 +2,8 @@
 // deterministic form, diffs a live server against it (drift), and lints
 // golang-migrate-style migration files. The normalizer maps ClickHouse Cloud's
 // Shared* engines back to their OSS equivalents so a Cloud dump and an OSS dump
-// compare equal.
+// compare equal, and strips the database qualifier so a dump is drift-comparable
+// across databases of different names (e.g. default vs a per-CI database).
 package schema
 
 import (
@@ -48,7 +49,7 @@ func Dump(ctx context.Context, conn Conn, db string, exclude ...string) ([]Objec
 		if skip[name] {
 			continue
 		}
-		objs = append(objs, Object{Name: name, IsMV: engine == "MaterializedView", DDL: Normalize(ddl)})
+		objs = append(objs, Object{Name: name, IsMV: engine == "MaterializedView", DDL: NormalizeForDB(ddl, db)})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -176,10 +177,26 @@ var (
 	asSelectRe           = regexp.MustCompile(`(?i)\s+AS\s+(SELECT|WITH|\()`)
 )
 
+// NormalizeForDB is Normalize with the database qualifier removed, so a schema
+// dumped from one database compares equal to the same schema in a differently
+// named database. It strips the known db name from object references — the
+// CREATE target and an MV's TO/FROM — before normalizing. Stripping is scoped to
+// db exactly (not any qualifier) so unrelated qualified expressions are left
+// intact. Dump calls this; use Normalize directly when the db qualifier is
+// meaningful.
+func NormalizeForDB(ddl, db string) string {
+	if db != "" {
+		re := regexp.MustCompile("(?i)(^|[\\s(,])`?" + regexp.QuoteMeta(db) + "`?\\.")
+		ddl = re.ReplaceAllString(ddl, "$1")
+	}
+	return Normalize(ddl)
+}
+
 // Normalize converts a raw create_table_query into a canonical, deterministic
 // form: Cloud Shared*/Replicated* engines are mapped to their OSS equivalents,
 // the default index_granularity is stripped, and the DDL head is reflowed by
 // clause. An MV's SELECT body is preserved verbatim (only whitespace-collapsed).
+// The database qualifier is preserved; use NormalizeForDB to drop it.
 func Normalize(ddl string) string {
 	ddl = strings.TrimSpace(ddl)
 	ddl = normalizeEngine(ddl)
