@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Record is one appended state entry. Records for an op are returned in
@@ -58,12 +57,15 @@ func (s *SQLStore) Ensure(ctx context.Context) error {
 	if s.ensured {
 		return nil
 	}
-	// seq tiebreaks the ts sort: rapid appends (e.g. backfill chunks) can share a
-	// wall-clock ts and would otherwise read back out of order, corrupting the
-	// "latest phase" the orchestrator reads. seq is monotonic within a process;
-	// across a resume the later ts already orders the new records after the old.
+	// ts is stamped by the server via DEFAULT now64(3): binding a client
+	// time.Now() truncates to whole seconds when written, collapsing distinct
+	// phase records onto the same tick. seq tiebreaks the ts sort so rapid
+	// same-tick appends still read back in append order — without it the
+	// orchestrator's "latest phase = records[len-1]" can resolve to a
+	// non-terminal phase. seq is monotonic within a process; across a resume the
+	// later ts already orders the new records after the old.
 	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-		ts        DateTime64(9) DEFAULT now64(9),
+		ts        DateTime64(3) DEFAULT now64(3),
 		seq       UInt64,
 		op_id     String,
 		spec_hash String,
@@ -83,9 +85,11 @@ func (s *SQLStore) Append(ctx context.Context, r Record) error {
 	if err := s.Ensure(ctx); err != nil {
 		return err
 	}
+	// ts is omitted so the server stamps it with DEFAULT now64(3) (real
+	// millisecond precision); binding a Go time truncates to whole seconds.
 	q := fmt.Sprintf(
-		"INSERT INTO %s (ts, seq, op_id, spec_hash, phase, status, cursor, detail) VALUES (?,?,?,?,?,?,?,?)", s.table)
-	if err := s.conn.Exec(ctx, q, time.Now(), s.seq.Add(1), r.OpID, r.SpecHash, r.Phase, r.Status, r.Cursor, r.Detail); err != nil {
+		"INSERT INTO %s (seq, op_id, spec_hash, phase, status, cursor, detail) VALUES (?,?,?,?,?,?,?)", s.table)
+	if err := s.conn.Exec(ctx, q, s.seq.Add(1), r.OpID, r.SpecHash, r.Phase, r.Status, r.Cursor, r.Detail); err != nil {
 		return fmt.Errorf("append %s: %w", s.table, err)
 	}
 	return nil

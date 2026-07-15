@@ -2,8 +2,41 @@ package rebuild
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
+
+// BUG 1 regression: Append must not bind ts, and the DDL must server-stamp it
+// via DEFAULT now64(3). Binding a Go time.Now() truncates to whole seconds and
+// collapses distinct phase records onto one tick, so the orchestrator's
+// "latest phase = records[len-1]" could read a non-terminal phase after a resume.
+func TestSQLStoreAppendServerStampsTs(t *testing.T) {
+	conn := &fakeConn{}
+	s := NewSQLStore(conn, "ops")
+	if err := s.Append(context.Background(), Record{OpID: "x", Phase: phaseValidated}); err != nil {
+		t.Fatal(err)
+	}
+
+	var ddl, insert string
+	for _, q := range conn.execs {
+		switch {
+		case strings.Contains(q, "CREATE TABLE IF NOT EXISTS"):
+			ddl = q
+		case strings.HasPrefix(strings.TrimSpace(q), "INSERT"):
+			insert = q
+		}
+	}
+	if !strings.Contains(ddl, "DEFAULT now64(3)") {
+		t.Fatalf("ts must be server-stamped via DEFAULT now64(3):\n%s", ddl)
+	}
+	cols := insert[strings.Index(insert, "(")+1 : strings.Index(insert, ")")]
+	if strings.Contains(cols, "ts") {
+		t.Fatalf("INSERT must not bind ts (server-stamps it): %s", insert)
+	}
+	if !strings.Contains(cols, "seq") {
+		t.Fatalf("INSERT should still carry the seq tiebreaker: %s", insert)
+	}
+}
 
 func TestSQLStoreRoundTrip(t *testing.T) {
 	conn := &fakeConn{
