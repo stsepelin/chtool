@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Validate & publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Validate semver tag
+        run: |
+          if ! echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Tag ${GITHUB_REF_NAME} is not a valid semver (vMAJOR.MINOR.PATCH)"; exit 1
+          fi
+
+      - name: Verify build & tests
+        run: |
+          go build ./...
+          go vet ./...
+          go test -race ./...
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+
+      # A Go module is "published" by the tag itself; requesting it through the
+      # module proxy makes `go get` and pkg.go.dev serve the new version at once.
+      - name: Warm the module proxy
+        run: |
+          module=$(go list -m)
+          curl -sf "https://proxy.golang.org/${module}/@v/${GITHUB_REF_NAME}.info" \
+            && echo "proxy indexed ${module}@${GITHUB_REF_NAME}" \
+            || echo "proxy warm skipped (will index on first fetch)"

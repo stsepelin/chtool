@@ -1,0 +1,28 @@
+version: "2"
+
+run:
+  build-tags:
+    - integration
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - bodyclose
+    - copyloopvar
+  settings:
+    errcheck:
+      # Deferred Close() on a query's rows is a read-path cleanup whose error is
+      # not actionable; the query error is what callers care about.
+      exclude-functions:
+        - (github.com/ClickHouse/clickhouse-go/v2/lib/driver.Rows).Close
+        - (github.com/ClickHouse/clickhouse-go/v2/lib/driver.Conn).Close
+
+formatters:
+  enable:
+    - gofmt
