@@ -131,11 +131,45 @@ enforce house rules before they run.
 
 | Function | Purpose |
 |---|---|
-| `Up(fsys, dsn)` | Apply all pending migrations |
-| `Steps(fsys, dsn, n)` | Apply (`n>0`) or revert (`n<0`) `n` migrations |
-| `Force(fsys, dsn, version)` | Set the version without running SQL (dirty-state recovery) |
-| `Version(fsys, dsn)` | Current `(version, dirty, err)` |
+| `Up(fsys, dsn)` / `UpContext(ctx, …)` | Apply all pending migrations |
+| `Steps(fsys, dsn, n)` / `StepsContext(ctx, …)` | Apply (`n>0`) or revert (`n<0`) `n` migrations |
+| `Force(fsys, dsn, version)` / `ForceContext(ctx, …)` | Set the version without running SQL (dirty-state recovery) |
+| `Version(fsys, dsn)` / `VersionContext(ctx, …)` | Current `(version, dirty, err)` |
 | `New(fsys, dsn)` | Build a `*migrate.Migrate` for advanced use |
+
+### Cancellation
+
+The `Context` variants bound a run — but it is worth being precise about what
+that buys you, because golang-migrate exposes no `context.Context` at all.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+
+if err := migrate.UpContext(ctx, migrations, dsn); err != nil {
+    if errors.Is(err, migrate.ErrStoppedEarly) {
+        // Stopped between migrations. Find out where we landed.
+        v, dirty, _ := migrate.Version(migrations, dsn)
+        log.Printf("stopped at version %d (dirty=%v)", v, dirty)
+    }
+    return err
+}
+```
+
+`UpContext` / `StepsContext` return `ctx.Err()` immediately if the context is
+already done, and on cancellation mid-run they ask golang-migrate to stop at its
+next safe break point — **after the in-flight migration finishes**. So a run
+stops *between* migrations, **never mid-statement**. That is the semantics you
+want on ClickHouse anyway: DDL is non-transactional, and killing it mid-statement
+is exactly how you get the dirty state `Force` exists to repair.
+
+A cancelled run therefore lands mid-sequence and returns an error wrapping both
+`ErrStoppedEarly` and `ctx.Err()` — re-check with `Version` to see where. A
+cancellation that races with normal completion reports the same way, so treat
+`ErrStoppedEarly` as *"re-check"*, not *"nothing was applied"*.
+
+`ForceContext` / `VersionContext` honour `ctx` only before their call begins:
+each is a single metadata operation with no safe mid-point to stop at.
 
 > This is the only subpackage that imports `golang-migrate`.
 
