@@ -22,6 +22,7 @@ linters:
       exclude-functions:
         - (github.com/ClickHouse/clickhouse-go/v2/lib/driver.Rows).Close
         - (github.com/ClickHouse/clickhouse-go/v2/lib/driver.Conn).Close
+        - (*database/sql.DB).Close
 
 formatters:
   enable:

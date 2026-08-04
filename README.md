@@ -27,6 +27,7 @@ only what you need.
 - [`chtool/schema` — snapshot, drift, lint](#chtoolschema--snapshot-drift-lint)
 - [`chtool/structs` — struct ↔ column helpers](#chtoolstructs--struct--column-helpers)
 - [`chtool/rebuild` — online table rebuilds](#chtoolrebuild--online-table-rebuilds)
+- [`chtool/chtest` — a throwaway ClickHouse for tests](#chtoolchtest--a-throwaway-clickhouse-for-tests)
 - [ClickHouse Cloud](#clickhouse-cloud)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -64,6 +65,7 @@ go get github.com/stsepelin/chtool
 | `chtool/schema` | `…/chtool/schema` | Schema `Dump` + Cloud-aware `Normalize` + drift `Diff` + migration `Lint` | — |
 | `chtool/structs` | `…/chtool/structs` | Generic `Insert[T]`, `VerifyTags[T]`, `CreateDDL[T]` over `ch:`-tagged structs | — |
 | `chtool/rebuild` | `…/chtool/rebuild` | Online `AggregatingMergeTree` rebuild orchestrator | — |
+| `chtool/chtest` | `…/chtool/chtest` | Throwaway ClickHouse container for integration tests | **separate module** (testcontainers) |
 
 Full API reference: **[pkg.go.dev/github.com/stsepelin/chtool](https://pkg.go.dev/github.com/stsepelin/chtool)**.
 
@@ -434,6 +436,64 @@ implement the interface yourself to journal progress anywhere else.
 
 ---
 
+## `chtool/chtest` — a throwaway ClickHouse for tests
+
+Starting a scratch ClickHouse is the boilerplate every consumer ends up writing
+— image pin, readiness polling, cleanup — and then drifting apart on. `chtest`
+is that helper, once.
+
+It is a **separate Go module**, so testcontainers-go and the Docker SDK never
+enter the dependency graph of the main `chtool` module. Require it only from the
+code that runs tests:
+
+```bash
+go get github.com/stsepelin/chtool/chtest
+```
+
+```go
+func TestSomething(t *testing.T) {
+    dsn := chtest.Start(t)                       // container + readiness + t.Cleanup
+    conn, _ := chtool.Open(t.Context(), dsn)
+    // ...
+}
+```
+
+For a package with several integration tests, share one container from
+`TestMain` — repeatedly creating and destroying servers is what makes
+ClickHouse's native handshake time out intermittently:
+
+```go
+func TestMain(m *testing.M) {
+    dsn, cleanup, err := chtest.StartMain()
+    if err != nil {
+        log.Fatal(err)
+    }
+    testDSN = dsn
+    code := m.Run()
+    cleanup()          // before os.Exit, which skips defers
+    os.Exit(code)
+}
+```
+
+| Symbol | Purpose |
+|---|---|
+| `Start(tb)` | Container + readiness wait + `tb.Cleanup`; returns a DSN |
+| `StartMain()` | Same, for `TestMain`: returns `(dsn, cleanup, err)` |
+| `WithDatabase(dsn, db)` | Repoint a DSN at another database (create it yourself) |
+| `Image` | The one image pin everyone shares |
+| `Env()` | The environment a scratch OSS container needs (see below) |
+
+**It composes with CI rather than replacing it.** If `CHTOOL_TEST_DSN` is set,
+no container is started and that DSN is handed back — so the same test code runs
+against a service container in CI and a throwaway container on a laptop.
+
+**The gotcha `Env()` encodes:** the official image's entrypoint disables network
+access for the `default` user unless told otherwise, logging *"neither
+CLICKHOUSE_USER nor CLICKHOUSE_PASSWORD is set, disabling network access for
+user 'default'"*. The container then looks healthy — a `clickhouse-client`
+health check passes over the local socket — while every connection from outside
+is refused. Setting `CLICKHOUSE_DB` alone does **not** fix it.
+
 ## ClickHouse Cloud
 
 `chtool` targets Cloud as a first-class case:
@@ -462,13 +522,28 @@ unreachable, and each uses its own scratch database that it drops afterward:
 
 ```bash
 # e.g. against a local container:
-#   docker run -d --name ch -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server
+#   docker run -d --name ch -p 9000:9000 -p 8123:8123 \
+#     -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:24.8
 CHTOOL_TEST_DSN=clickhouse://localhost:9000/default go test -tags integration ./...
 ```
 
+Note the `CLICKHOUSE_SKIP_USER_SETUP=1` — without it the container refuses
+connections from outside while still looking healthy. [`chtool/chtest`](#chtoolchtest--a-throwaway-clickhouse-for-tests)
+encodes that (and the readiness wait) so you do not have to.
+
+`chtest` is a separate module, so its own tests run separately:
+
+```bash
+cd chtest && go test ./...          # starts a real container
+cd chtest && go test -short ./...   # skips it
+```
+
 CI runs unit tests (with `-race` + coverage), the integration suite against a
-ClickHouse service container, `golangci-lint`, and `govulncheck` on every push and
-PR — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+ClickHouse service container, the nested `chtest` module, `golangci-lint`, and
+`govulncheck` on every push and PR — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). One CI step asserts the
+main module's build graph never picks up Docker/testcontainers packages, which
+is the whole reason `chtest` is a separate module.
 
 ## Contributing
 
