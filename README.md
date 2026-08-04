@@ -96,6 +96,20 @@ owns `Close`.
 | Cloud / remote | `clickhouse://user:pw@host:9440/db` (TLS auto-on, verified) |
 | Self-signed cert | `clickhouse://…?secure=true&skip_verify=true` (explicit opt-in) |
 
+`WaitReady(ctx, dsn)` blocks until the server can serve a query — the gate to put
+behind a compose `depends_on` or a freshly started container. A server can accept
+a connection while still starting up, so readiness is proved with a real query
+rather than a ping alone. Bound it with a deadline; the error wraps `ctx.Err()`
+and carries the last connection failure.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+defer cancel()
+if err := chtool.WaitReady(ctx, dsn); err != nil {
+    log.Fatal(err)
+}
+```
+
 ---
 
 ## `chtool/migrate` — migrations
@@ -135,7 +149,15 @@ enforce house rules before they run.
 | `Steps(fsys, dsn, n)` / `StepsContext(ctx, …)` | Apply (`n>0`) or revert (`n<0`) `n` migrations |
 | `Force(fsys, dsn, version)` / `ForceContext(ctx, …)` | Set the version without running SQL (dirty-state recovery) |
 | `Version(fsys, dsn)` / `VersionContext(ctx, …)` | Current `(version, dirty, err)` |
+| `Create(dir, name)` | Scaffold the next `NNNNNN_name.up.sql` (gapless, `O_EXCL`) |
 | `New(fsys, dsn)` | Build a `*migrate.Migrate` for advanced use |
+
+`Create` puts the constructor next to the validator: it numbers one past the
+highest existing migration so the run stays gapless for `schema.Lint`, accepts
+only a lowercase `[a-z0-9_]` slug (which also makes `..` and path separators
+unrepresentable), and uses `O_EXCL` so it never truncates an existing migration.
+It writes only the `.up.sql` — a `.down.sql` is optional, and an empty one is
+worse than none, since ClickHouse rejects an empty statement at runtime.
 
 ### Cancellation
 
@@ -308,7 +330,7 @@ o := &rebuild.Orchestrator{
     Spec:  spec,
     Store: rebuild.NewSQLStore(conn, "analytics._chtool_ops"),
     Log:   func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
-    // ReconcileGuard: func() error { ... } // optional gate run before cutover
+    // ReconcileGuard: rebuild.CompanionInFS(migrations, spec), // optional gate before cutover
 }
 
 _ = rebuild.Plan(ctx, o, false)                                  // read-only preflight + cost probe
@@ -325,6 +347,13 @@ _ = rebuild.Cutover(ctx, o, time.Now())                          // the swap
 | `Status(ctx, o)` | Print the current phase and backfill progress. |
 | `Abort(ctx, o)` | Tear down `*_v2` objects before cutover; never touches the live pipeline. |
 | `Cutover(ctx, o, now)` | Drop MVs → `RENAME` (old → dated backup, v2 → live) → recreate MVs. |
+
+`CompanionInFS(fsys, spec)` is a ready-made `ReconcileGuard` that refuses cutover
+unless the spec's `companion_migration` is present in the given `fs.FS` — pass
+the same `embed.FS` the binary migrates from. That is the point: the guarantee
+you want is that the *running binary* carries the companion migration, which an
+`os.Stat` on a working-directory-relative path does not check. It fails closed —
+a spec with no `companion_migration` is an error, not a silent pass.
 
 The connection's **default database must be the rebuild target's database** — your
 `new_ddl.sql` runs verbatim (only the table name is retargeted, not the database).

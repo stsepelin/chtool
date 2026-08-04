@@ -46,6 +46,38 @@ func Open(ctx context.Context, dsn string) (Conn, error) {
 	return conn, nil
 }
 
+// WaitReady polls until the server at dsn accepts queries, or ctx ends. A
+// server can accept a connection while still starting up, so readiness is
+// proved with a real query rather than a ping alone — which is what makes this
+// usable as the gate behind a compose depends_on or a freshly started test
+// container.
+//
+// It returns nil as soon as a query succeeds, or an error wrapping ctx.Err()
+// (so errors.Is against context.DeadlineExceeded works) with the last
+// connection failure attached for diagnosis. Bound it with a ctx deadline;
+// otherwise it polls forever.
+func WaitReady(ctx context.Context, dsn string) error {
+	const poll = 250 * time.Millisecond
+	var lastErr error
+	for {
+		conn, err := Open(ctx, dsn)
+		if err == nil {
+			err = conn.Exec(ctx, "SELECT 1")
+			_ = conn.Close()
+			if err == nil {
+				return nil
+			}
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("clickhouse not ready: %w (last attempt: %v)", ctx.Err(), lastErr)
+		case <-time.After(poll):
+		}
+	}
+}
+
 // isLocal reports whether every address is loopback. An empty list is not
 // local, so TLS stays on.
 func isLocal(addrs []string) bool {
