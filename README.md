@@ -195,6 +195,13 @@ cancellation that races with normal completion reports the same way, so treat
 `ForceContext` / `VersionContext` honour `ctx` only before their call begins:
 each is a single metadata operation with no safe mid-point to stop at.
 
+> **Cancelling under `-race`** reports a data race inside golang-migrate
+> (v4.19.1) — `Migrate.stop()` reads and writes the unsynchronised
+> `isGracefulStop` from two goroutines, so merely using `GracefulStop` trips the
+> detector. It is benign for correctness (the flag is only ever set to true, and
+> whichever goroutine observes it halts the run), but a suite running with
+> `-race` will see the report. It is upstream's to fix.
+
 > This is the only subpackage that imports `golang-migrate`.
 
 ---

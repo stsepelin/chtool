@@ -30,6 +30,20 @@
 //
 // ForceContext and VersionContext honour ctx only before their call begins:
 // each is a single metadata operation with no safe mid-point to stop at.
+//
+// # Cancellation trips the race detector
+//
+// Cancelling a run under -race reports a data race inside golang-migrate
+// (v4.19.1), not in this package: Migrate.stop() reads and writes the
+// unsynchronised Migrate.isGracefulStop from both the migration-running
+// goroutine and the read-ahead producer goroutine. Merely using GracefulStop is
+// enough to trip it.
+//
+// It is benign for correctness — the flag is only ever set to true, and whichever
+// goroutine observes it halts the run (the producer returning closes the channel
+// the runner ranges over) — but a consumer whose own suite runs with -race will
+// see the report. If that matters, do not cancel migrations under -race until
+// the fix lands upstream.
 package migrate
 
 import (
