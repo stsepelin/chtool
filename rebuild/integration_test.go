@@ -723,3 +723,65 @@ func TestIntegrationStateStoreExistingSupersetTable(t *testing.T) {
 		t.Fatalf("expected the 13-column superset table to survive, got %d columns", got)
 	}
 }
+
+// The caller-owned table check must catch a real mistake against a real server,
+// up front, instead of letting it surface as a raw INSERT error mid-rebuild.
+func TestIntegrationUseExistingTableVerification(t *testing.T) {
+	const db = "chtool_it_verify"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Pointed at a table that was never created.
+	err := NewSQLStore(conn, db+".absent").UseExistingTable().Ensure(ctx)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("an absent table should be named up front, got: %v", err)
+	}
+
+	// A table missing the seq tiebreaker — the mistake that silently breaks
+	// ordering — must be refused before a single row is written.
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".no_seq ("+
+		"ts DateTime64(3) DEFAULT now64(3), op_id String, spec_hash String, "+
+		"phase String, status String, cursor String, detail String"+
+		") ENGINE = MergeTree ORDER BY ts"); err != nil {
+		t.Fatal(err)
+	}
+	store := NewSQLStore(conn, db+".no_seq").UseExistingTable()
+	if err := store.Append(ctx, Record{OpID: "x", Phase: phaseCreated}); err == nil {
+		t.Fatal("append to a table without seq should fail verification")
+	} else if !strings.Contains(err.Error(), "seq") {
+		t.Fatalf("the error must name the missing column, got: %v", err)
+	}
+	if n := scalarU64(t, conn, "SELECT count() FROM "+db+".no_seq"); n != 0 {
+		t.Fatalf("verification must fail before writing, found %d rows", n)
+	}
+
+	// A ts with no server-side default is the silent one: every row would share
+	// the zero timestamp and ordering would collapse onto per-store seq.
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".no_default ("+
+		"ts DateTime64(3), seq UInt64, op_id String, spec_hash String, "+
+		"phase String, status String, cursor String, detail String"+
+		") ENGINE = MergeTree ORDER BY (ts, seq)"); err != nil {
+		t.Fatal(err)
+	}
+	err = NewSQLStore(conn, db+".no_default").UseExistingTable().Ensure(ctx)
+	if err == nil || !strings.Contains(err.Error(), "no server-side default on ts") {
+		t.Fatalf("a ts without a server default should be refused, got: %v", err)
+	}
+
+	// The conforming table from the documented DDL passes.
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".good ("+
+		"ts DateTime64(3) DEFAULT now64(3), seq UInt64, op_id String, spec_hash String, "+
+		"phase String, status String, cursor String, detail String, extra String"+
+		") ENGINE = MergeTree ORDER BY (ts, seq)"); err != nil {
+		t.Fatal(err)
+	}
+	good := NewSQLStore(conn, db+".good").UseExistingTable()
+	if err := good.Append(ctx, Record{OpID: "x", Phase: phaseValidated, Status: "done"}); err != nil {
+		t.Fatalf("a conforming superset table must pass: %v", err)
+	}
+	recs, err := good.Records(ctx, "x")
+	if err != nil || len(recs) != 1 || recs[0].Phase != phaseValidated {
+		t.Fatalf("round-trip through the verified table failed: %+v %v", recs, err)
+	}
+}

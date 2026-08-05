@@ -55,6 +55,31 @@ type fakeConn struct {
 	stateRows     []scriptRow // rows returned for a state-store Records query
 	lockedSetting string      // a READONLY backfill setting name, if any
 	hashSeenCount uint64      // count returned for SpecHashSeen
+	// columns overrides what system.columns reports for the state table; nil
+	// means a table that satisfies the UseExistingTable contract. Set it to
+	// script a missing table (empty non-nil) or a broken one.
+	columns []scriptRow
+	// queries counts system.columns lookups, so a test can assert the
+	// caller-owned table check is cached rather than run per append.
+	queries   int
+	lastQuery string
+}
+
+// validStateColumns is what system.columns reports for a conforming
+// caller-owned state table: (name, type, default_expression).
+func validStateColumns() []scriptRow {
+	out := []scriptRow{{"ts", "DateTime64(3)", "now64(3)"}}
+	for _, c := range RequiredColumns {
+		if c == "ts" {
+			continue
+		}
+		typ := "String"
+		if c == "seq" {
+			typ = "UInt64"
+		}
+		out = append(out, scriptRow{c, typ, ""})
+	}
+	return out
 }
 
 func (c *fakeConn) Exec(_ context.Context, query string, _ ...any) error {
@@ -87,6 +112,13 @@ func (c *fakeConn) route(q string) ([]scriptRow, error) {
 		mv = sampleMV
 	}
 	switch {
+	case strings.Contains(q, "system.columns"): // caller-owned table verification
+		c.queries++
+		c.lastQuery = q
+		if c.columns != nil {
+			return c.columns, nil
+		}
+		return validStateColumns(), nil
 	case strings.Contains(q, "op_id, spec_hash"): // state-store Records
 		return c.stateRows, nil
 	case strings.Contains(q, "spec_hash = ?"): // state-store SpecHashSeen count

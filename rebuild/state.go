@@ -3,6 +3,7 @@ package rebuild
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -108,16 +109,24 @@ func (s *SQLStore) UseExistingTable() *SQLStore {
 	return s
 }
 
-// Ensure creates the state table if absent, unless the table is caller-owned
-// (UseExistingTable), in which case it is a no-op. The DDL runs at most once per
-// store after it first succeeds, keeping it off the per-append hot path.
+// Ensure creates the state table if absent. When the table is caller-owned
+// (UseExistingTable) it runs no DDL and instead verifies the table satisfies the
+// contract, so a missing table or a missing column is a clear error here rather
+// than a raw driver error from an INSERT partway through a rebuild.
+//
+// Either way the work happens at most once per store after it first succeeds,
+// keeping it off the per-append hot path.
 func (s *SQLStore) Ensure(ctx context.Context) error {
-	if s.external {
-		return nil
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ensured {
+		return nil
+	}
+	if s.external {
+		if err := s.verifyTable(ctx); err != nil {
+			return err
+		}
+		s.ensured = true
 		return nil
 	}
 	// ts is stamped by the server via DEFAULT now64(3): binding a client
@@ -142,6 +151,84 @@ func (s *SQLStore) Ensure(ctx context.Context) error {
 	}
 	s.ensured = true
 	return nil
+}
+
+// verifyTable checks a caller-owned table satisfies the UseExistingTable
+// contract. It runs once per store, on the first Ensure.
+//
+// The ts default gets its own check because getting it wrong fails silently
+// rather than loudly: Append omits ts so the server stamps it, so a column with
+// no default takes the zero value on every row. Every record then shares one
+// timestamp, ordering collapses onto seq alone, and seq restarts per store — the
+// exact ordering bug the tiebreaker exists to prevent, reintroduced by a table
+// that looks fine.
+func (s *SQLStore) verifyTable(ctx context.Context) error {
+	db, table := splitTable(s.table)
+
+	query := "SELECT name, type, default_expression FROM system.columns WHERE database = currentDatabase() AND table = ?"
+	args := []any{table}
+	if db != "" {
+		query = "SELECT name, type, default_expression FROM system.columns WHERE database = ? AND table = ?"
+		args = []any{db, table}
+	}
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("verify state table %s: %w", s.table, err)
+	}
+	defer rows.Close()
+
+	types, defaults := map[string]string{}, map[string]string{}
+	for rows.Next() {
+		var name, typ, def string
+		if err := rows.Scan(&name, &typ, &def); err != nil {
+			return fmt.Errorf("verify state table %s: %w", s.table, err)
+		}
+		types[name], defaults[name] = typ, def
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("verify state table %s: %w", s.table, err)
+	}
+
+	if len(types) == 0 {
+		return fmt.Errorf("state table %s does not exist: UseExistingTable says you create it, "+
+			"and it must provide %s — see the UseExistingTable docs for the DDL",
+			s.table, strings.Join(RequiredColumns, ", "))
+	}
+	var missing []string
+	for _, c := range RequiredColumns {
+		if _, ok := types[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("state table %s is missing column(s) %s: it must provide %s — "+
+			"see the UseExistingTable docs for the DDL",
+			s.table, strings.Join(missing, ", "), strings.Join(RequiredColumns, ", "))
+	}
+
+	if !strings.Contains(types["ts"], "DateTime64") {
+		return fmt.Errorf("state table %s has ts of type %s, want DateTime64(3): "+
+			"records are ordered by (ts, seq), so a coarser ts loses the ordering seq only tiebreaks",
+			s.table, types["ts"])
+	}
+	if !strings.Contains(strings.ToLower(defaults["ts"]), "now") {
+		return fmt.Errorf("state table %s has no server-side default on ts (want DEFAULT now64(3)): "+
+			"appends omit ts so the server stamps it, so without a default every record shares the zero "+
+			"timestamp and resume can read the wrong latest record",
+			s.table)
+	}
+	return nil
+}
+
+// splitTable splits a possibly db-qualified, possibly backtick-quoted table name
+// into its database and table parts. An empty database means the connection's
+// current database.
+func splitTable(name string) (db, table string) {
+	unquote := func(s string) string { return strings.Trim(strings.TrimSpace(s), "`") }
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return unquote(name[:i]), unquote(name[i+1:])
+	}
+	return "", unquote(name)
 }
 
 func (s *SQLStore) Append(ctx context.Context, r Record) error {
