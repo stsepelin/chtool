@@ -25,6 +25,11 @@ import (
 // because a guard that can verify nothing should not silently pass.
 func CompanionInFS(fsys fs.FS, spec *Spec) func() error {
 	return func() error {
+		// Guards run immediately before cutover, so a nil spec must surface as a
+		// refusal rather than a panic in the middle of the swap.
+		if spec == nil {
+			return fmt.Errorf("CompanionInFS was given a nil spec, so it has nothing to verify")
+		}
 		want := strings.TrimSpace(spec.Companion)
 		if want == "" {
 			return fmt.Errorf("spec %q declares no companion_migration, so CompanionInFS has nothing to verify", spec.Name)

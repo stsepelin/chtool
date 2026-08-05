@@ -16,6 +16,9 @@ var nameRe = regexp.MustCompile(`^[a-z0-9_]+$`)
 // seqRe matches any migration file so Create can find the highest sequence.
 var seqRe = regexp.MustCompile(`^(\d{6})_[a-z0-9_]+\.(?:up|down)\.sql$`)
 
+// maxSeq is the highest sequence expressible in the six digits Lint requires.
+const maxSeq = 999999
+
 // Create scaffolds the next migration in dir and returns its path.
 //
 // The sequence number is one past the highest already present (000001 in an
@@ -51,6 +54,12 @@ func Create(dir, name string) (path string, err error) {
 		}
 	}
 
+	// Past six digits the name no longer matches the NNNNNN_ convention Lint
+	// enforces — and seqRe would stop counting it, so the next Create would
+	// silently reuse a sequence. Refuse rather than emit a file that breaks both.
+	if highest >= maxSeq {
+		return "", fmt.Errorf("migration sequence exhausted: %06d is the highest six-digit sequence", maxSeq)
+	}
 	path = filepath.Join(dir, fmt.Sprintf("%06d_%s.up.sql", highest+1, name))
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

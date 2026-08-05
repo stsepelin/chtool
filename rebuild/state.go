@@ -29,6 +29,11 @@ type Record struct {
 // same-tick appends read back in undefined order can rewind a cursor, re-run a
 // chunk, and double-count rows into an AggregatingMergeTree.
 //
+// One rebuild is expected to be driven by one orchestrator at a time, so this
+// contract is about a single writer's appends. Two processes racing on the same
+// op are not ordered against each other by SQLStore (see UseExistingTable), and
+// are not a supported way to run a rebuild.
+//
 // Prefer NewSQLStore over a fresh implementation. To keep rebuild state in your
 // own wider table (extra audit columns, say), point it at that table and call
 // UseExistingTable rather than reimplementing this interface.
@@ -85,7 +90,7 @@ func NewSQLStore(conn Conn, table string) *SQLStore {
 // semantics as the DDL in Ensure:
 //
 //	ts        DateTime64(3) DEFAULT now64(3)  -- server-stamped; do not bind a client time
-//	seq       UInt64                          -- monotonic tiebreaker within a process
+//	seq       UInt64                          -- per-store tiebreaker, see below
 //	op_id     String
 //	spec_hash String
 //	phase     String
@@ -93,7 +98,11 @@ func NewSQLStore(conn Conn, table string) *SQLStore {
 //	cursor    String
 //	detail    String
 //
-// ordered by (ts, seq) so records read back in append order.
+// ordered by (ts, seq), which reads back in append order for one store's
+// appends. seq counts per SQLStore, so it does not order two stores against
+// each other; what separates a resume from the run before it is the later ts,
+// not seq. Driving one rebuild from two orchestrators at once is unsupported
+// for this reason among others.
 func (s *SQLStore) UseExistingTable() *SQLStore {
 	s.external = true
 	return s

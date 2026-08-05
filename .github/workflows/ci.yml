@@ -57,7 +57,13 @@ jobs:
       - name: go.mod tidy
         run: |
           go mod tidy
-          git diff --exit-code -- go.mod go.sum
+          # --porcelain also catches a generated-but-untracked go.sum, which
+          # git diff would silently pass.
+          if [ -n "$(git status --porcelain -- go.mod go.sum)" ]; then
+            echo "go.mod/go.sum are not tidy or not committed:"
+            git status --short -- go.mod go.sum
+            exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Unit tests (race + coverage)
@@ -83,13 +89,19 @@ jobs:
       - name: go.mod tidy
         run: |
           go mod tidy
-          git diff --exit-code -- go.mod go.sum
+          # --porcelain also catches a generated-but-untracked go.sum, which
+          # git diff would silently pass.
+          if [ -n "$(git status --porcelain -- go.mod go.sum)" ]; then
+            echo "go.mod/go.sum are not tidy or not committed:"
+            git status --short -- go.mod go.sum
+            exit 1
+          fi
         working-directory: chtest
       # Guards the reason chtest is a separate module: its Docker/testcontainers
       # dependencies must never reach the main module's build graph.
       - name: Assert main module stays dependency-light
         run: |
-          if go list -deps ./... | grep -qiE 'testcontainers|moby/|docker/docker'; then
+          if go list -deps ./... | grep -qiE 'testcontainers|moby/|docker/docker|docker/go-connections'; then
             echo "main module now builds Docker/testcontainers packages"; exit 1
           fi
           echo "main module build graph is clean"

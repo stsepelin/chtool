@@ -43,6 +43,19 @@ func TestCompanionInFSIgnoresDownOnly(t *testing.T) {
 	}
 }
 
+// The guard runs immediately before cutover, so a nil spec must be a refusal
+// rather than a panic mid-swap.
+func TestCompanionInFSFailsOnNilSpec(t *testing.T) {
+	guard := CompanionInFS(companionFS(), nil)
+	err := guard()
+	if err == nil {
+		t.Fatal("a nil spec must be refused, not accepted")
+	}
+	if !strings.Contains(err.Error(), "nil spec") {
+		t.Fatalf("error should name the cause: %v", err)
+	}
+}
+
 // Fail closed: a guard that can verify nothing must not silently pass.
 func TestCompanionInFSFailsWithoutCompanion(t *testing.T) {
 	if err := CompanionInFS(companionFS(), &Spec{Name: "s"})(); err == nil {
