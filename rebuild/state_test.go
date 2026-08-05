@@ -34,6 +34,224 @@ func TestSQLStoreUseExistingTableRunsNoDDL(t *testing.T) {
 	}
 }
 
+// A caller-owned table is verified once, up front, so a wrong or absent table
+// is named here rather than surfacing as a raw INSERT error mid-rebuild.
+func TestUseExistingTableVerification(t *testing.T) {
+	valid := validStateColumns()
+	without := func(col string) []scriptRow {
+		var out []scriptRow
+		for _, r := range valid {
+			if r[0] != col {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	replace := func(col string, row scriptRow) []scriptRow {
+		out := append([]scriptRow(nil), valid...)
+		for i := range out {
+			if out[i][0] == col {
+				out[i] = row
+			}
+		}
+		return out
+	}
+
+	cases := []struct {
+		name    string
+		columns []scriptRow
+		wantErr []string // substrings the message must carry
+	}{
+		{
+			name:    "table does not exist",
+			columns: []scriptRow{},
+			wantErr: []string{"audit.ops", "does not exist", "UseExistingTable"},
+		},
+		{
+			name:    "missing the seq tiebreaker",
+			columns: without("seq"),
+			wantErr: []string{"audit.ops", "seq", "missing column"},
+		},
+		{
+			name:    "missing a payload column",
+			columns: without("spec_hash"),
+			wantErr: []string{"spec_hash", "missing column"},
+		},
+		{
+			name:    "ts is not server-stamped",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", ""}),
+			wantErr: []string{"DEFAULT now64(3)", "found none"},
+		},
+		{
+			name:    "ts is too coarse to order by",
+			columns: replace("ts", scriptRow{"ts", "DateTime", "now64(3)"}),
+			wantErr: []string{"DateTime64(3) or finer", "ordered by"},
+		},
+		{
+			// now() is second-precision even in a DateTime64(3) column, so it
+			// silently collapses same-second appends onto one tick.
+			name:    "ts defaults to now() rather than now64()",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", "now()"}),
+			wantErr: []string{"DEFAULT now64(3)", "whole-second"},
+		},
+		{
+			name:    "ts precision is coarser than milliseconds",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(0)", "now64(0)"}),
+			wantErr: []string{"DateTime64(3) or finer"},
+		},
+		{
+			// now64(0) is whole seconds too, in a column that looks right.
+			name:    "ts default is now64 at second scale",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", "now64(0)"}),
+			wantErr: []string{"now64(3) or finer", "now64(0)"},
+		},
+		{
+			// A String seq sorts lexicographically: the tenth append would come
+			// back before the second.
+			name:    "seq cannot sort numerically",
+			columns: replace("seq", scriptRow{"seq", "String", ""}),
+			wantErr: []string{"seq of type String", "UInt64", "lexicographically"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := NewSQLStore(&fakeConn{columns: c.columns}, "audit.ops").UseExistingTable()
+			err := s.Ensure(context.Background())
+			if err == nil {
+				t.Fatal("expected verification to fail")
+			}
+			for _, want := range c.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error should mention %q, got: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// A conforming table passes, and the check is cached rather than repeated on
+// every append.
+func TestUseExistingTableVerifiesOnceAndCaches(t *testing.T) {
+	conn := &fakeConn{}
+	s := NewSQLStore(conn, "audit.ops").UseExistingTable()
+	ctx := context.Background()
+
+	for range 3 {
+		if err := s.Append(ctx, Record{OpID: "x", Phase: phaseCreated}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Records(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if conn.queries != 1 {
+		t.Fatalf("verification should run once, ran %d times", conn.queries)
+	}
+	if countContains(conn.execs, "CREATE TABLE") != 0 {
+		t.Fatalf("a caller-owned table must never get DDL: %v", conn.execs)
+	}
+}
+
+// A bare (unqualified) table is looked up in the connection's current database.
+func TestVerifyUsesCurrentDatabaseForBareTable(t *testing.T) {
+	conn := &fakeConn{}
+	if err := NewSQLStore(conn, "ops").UseExistingTable().Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(conn.lastQuery, "currentDatabase()") {
+		t.Fatalf("a bare table should resolve via currentDatabase(), got: %s", conn.lastQuery)
+	}
+}
+
+// A table that exceeds the contract must not be rejected: finer ts precision
+// and a wider integer seq both order correctly.
+func TestUseExistingTableAcceptsStricterTypes(t *testing.T) {
+	cases := map[string]scriptRow{
+		"finer ts precision":      {"ts", "DateTime64(9)", "now64(9)"},
+		"ts with a timezone":      {"ts", "DateTime64(3, 'UTC')", "now64(3)"},
+		"default with a timezone": {"ts", "DateTime64(3)", "now64(3, 'UTC')"},
+		"bare now64() is scale 3": {"ts", "DateTime64(3)", "now64()"},
+		"wider integer seq":       {"seq", "Int64", ""},
+	}
+	for name, override := range cases {
+		t.Run(name, func(t *testing.T) {
+			cols := append([]scriptRow(nil), validStateColumns()...)
+			for i := range cols {
+				if cols[i][0] == override[0] {
+					cols[i] = override
+				}
+			}
+			s := NewSQLStore(&fakeConn{columns: cols}, "audit.ops").UseExistingTable()
+			if err := s.Ensure(context.Background()); err != nil {
+				t.Fatalf("a table stricter than the contract should pass: %v", err)
+			}
+		})
+	}
+}
+
+func TestDateTime64Precision(t *testing.T) {
+	cases := []struct {
+		typ  string
+		prec int
+		ok   bool
+	}{
+		{"DateTime64(3)", 3, true},
+		{"DateTime64(9)", 9, true},
+		{"DateTime64(0)", 0, true},
+		{"DateTime64(3, 'UTC')", 3, true},
+		{"DateTime", 0, false},
+		{"String", 0, false},
+		{"DateTime64()", 0, false},
+	}
+	for _, c := range cases {
+		prec, ok := dateTime64Precision(c.typ)
+		if ok != c.ok || (ok && prec != c.prec) {
+			t.Errorf("dateTime64Precision(%q) = (%d,%v), want (%d,%v)", c.typ, prec, ok, c.prec, c.ok)
+		}
+	}
+}
+
+func TestNow64Scale(t *testing.T) {
+	cases := []struct {
+		expr  string
+		scale int
+		ok    bool
+	}{
+		{"now64(3)", 3, true},
+		{"now64(9)", 9, true},
+		{"now64(0)", 0, true}, // parses, but the caller rejects scale < 3
+		{"now64()", 3, true},  // the function's own default
+		{"now64(3, 'UTC')", 3, true},
+		{"NOW64(3)", 3, true},
+		{" now64(3) ", 3, true},
+		{"now()", 0, false},
+		{"", 0, false},
+		{"toDateTime64(now(), 3)", 0, false},
+		{"now64", 0, false},
+	}
+	for _, c := range cases {
+		scale, ok := now64Scale(c.expr)
+		if ok != c.ok || (ok && scale != c.scale) {
+			t.Errorf("now64Scale(%q) = (%d,%v), want (%d,%v)", c.expr, scale, ok, c.scale, c.ok)
+		}
+	}
+}
+
+func TestSplitTable(t *testing.T) {
+	cases := map[string][2]string{
+		"ops":                {"", "ops"},
+		"analytics.ops":      {"analytics", "ops"},
+		"`analytics`.`ops`":  {"analytics", "ops"},
+		" analytics . ops  ": {"analytics", "ops"},
+	}
+	for in, want := range cases {
+		db, table := splitTable(in)
+		if db != want[0] || table != want[1] {
+			t.Errorf("splitTable(%q) = (%q,%q), want (%q,%q)", in, db, table, want[0], want[1])
+		}
+	}
+}
+
 // The default (unowned) store still creates its table.
 func TestSQLStoreDefaultStillEnsures(t *testing.T) {
 	conn := &fakeConn{}

@@ -445,6 +445,29 @@ than forced.
 `SpecHashSeen`). `NewSQLStore` gives you an append-only ClickHouse-backed default;
 implement the interface yourself to journal progress anywhere else.
 
+**Prefer keeping `SQLStore` over reimplementing it.** To hold rebuild state in
+your own wider table — one that also carries your operator audit columns, say —
+point `NewSQLStore` at that table and call `UseExistingTable()`:
+
+```go
+store := rebuild.NewSQLStore(conn, "analytics.ops").UseExistingTable()
+```
+
+That declares the table yours: `Ensure` runs no DDL, so it can't race your
+migration and win by creating a narrow table. On first use it verifies the table
+instead — checking it exists, provides `RequiredColumns`, and has a **server-side
+default on `ts`** — and fails with a message naming the table and the missing
+columns, rather than letting the mistake surface as a raw driver error partway
+through a rebuild. The check is cached, so it stays off the per-append path.
+
+The `ts` default earns its own check because getting it wrong fails *silently*:
+appends omit `ts` so the server stamps it, so a column without a default takes
+the zero value on every row, ordering collapses onto `seq` alone, and `seq`
+restarts per store. That is the ordering bug the tiebreaker exists to prevent —
+and reimplementing `StateStore` without `seq` is how it was hit for real: it can
+rewind a backfill cursor, re-run a chunk, and double-count rows into an
+`AggregatingMergeTree`.
+
 ---
 
 ## `chtool/chtest` — a throwaway ClickHouse for tests
@@ -489,14 +512,46 @@ func TestMain(m *testing.M) {
 | Symbol | Purpose |
 |---|---|
 | `Start(tb)` | Container + readiness wait + `tb.Cleanup`; returns a DSN |
+| `StartWith(tb, Options{…})` | Same, with an explicit image |
 | `StartMain()` | Same, for `TestMain`: returns `(dsn, cleanup, err)` |
+| `StartContainer(Options{…})` | The `testing.TB`-free entry point the others wrap — usable from a tool, not just a test |
 | `WithDatabase(dsn, db)` | Repoint a DSN at another database (create it yourself) |
-| `Image` | The one image pin everyone shares |
+| `Image` | The shared default image pin |
 | `Env()` | The environment a scratch OSS container needs (see below) |
 
 **It composes with CI rather than replacing it.** If `CHTOOL_TEST_DSN` is set,
 no container is started and that DSN is handed back — so the same test code runs
 against a service container in CI and a throwaway container on a laptop.
+
+### Choosing the image
+
+`Image` is the shared default, and using it is the point: unmanaged pins drifting
+apart across repos is the failure mode this package exists to stop.
+
+Tracking a *specific* server is not that failure mode. A repo that deploys
+against a managed ClickHouse — or that generates a committed schema artifact from
+a scratch container and diffs it against that server — has to match the version
+it deploys against, or it risks systematic false drift in its own safety check.
+So deviating is possible, but explicit and greppable:
+
+```go
+// Pinned in code, as one repo-wide constant: the single source of truth.
+dsn := chtest.StartWith(t, chtest.Options{Image: internal.ClickHouseImage})
+```
+
+```bash
+# Or from the environment, so a CI matrix can vary it with no code change.
+CHTOOL_TEST_IMAGE=clickhouse/clickhouse-server:26.2 go test -tags integration ./...
+```
+
+`Options.Image` wins over `CHTOOL_TEST_IMAGE`, which wins over `Image` — an
+explicit argument should not be silently overridden by an ambient variable. Any
+non-default image is logged with where it came from, so an unexpected override
+shows up in test output rather than passing unnoticed.
+
+Keep an override in **exactly one place** in the consuming repo. One pin that
+deliberately tracks a server is a decision; the same pin copied into three
+packages is the drift this package is trying to prevent.
 
 **The gotcha `Env()` encodes:** the official image's entrypoint disables network
 access for the `default` user unless told otherwise, logging *"neither
