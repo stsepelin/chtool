@@ -100,6 +100,12 @@ func TestUseExistingTableVerification(t *testing.T) {
 			wantErr: []string{"DateTime64(3) or finer"},
 		},
 		{
+			// now64(0) is whole seconds too, in a column that looks right.
+			name:    "ts default is now64 at second scale",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", "now64(0)"}),
+			wantErr: []string{"now64(3) or finer", "now64(0)"},
+		},
+		{
 			// A String seq sorts lexicographically: the tenth append would come
 			// back before the second.
 			name:    "seq cannot sort numerically",
@@ -161,8 +167,11 @@ func TestVerifyUsesCurrentDatabaseForBareTable(t *testing.T) {
 // and a wider integer seq both order correctly.
 func TestUseExistingTableAcceptsStricterTypes(t *testing.T) {
 	cases := map[string]scriptRow{
-		"finer ts precision": {"ts", "DateTime64(9)", "now64(9)"},
-		"ts with a timezone": {"ts", "DateTime64(3, 'UTC')", "now64(3)"},
+		"finer ts precision":      {"ts", "DateTime64(9)", "now64(9)"},
+		"ts with a timezone":      {"ts", "DateTime64(3, 'UTC')", "now64(3)"},
+		"default with a timezone": {"ts", "DateTime64(3)", "now64(3, 'UTC')"},
+		"bare now64() is scale 3": {"ts", "DateTime64(3)", "now64()"},
+		"wider integer seq":       {"seq", "Int64", ""},
 	}
 	for name, override := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -198,6 +207,32 @@ func TestDateTime64Precision(t *testing.T) {
 		prec, ok := dateTime64Precision(c.typ)
 		if ok != c.ok || (ok && prec != c.prec) {
 			t.Errorf("dateTime64Precision(%q) = (%d,%v), want (%d,%v)", c.typ, prec, ok, c.prec, c.ok)
+		}
+	}
+}
+
+func TestNow64Scale(t *testing.T) {
+	cases := []struct {
+		expr  string
+		scale int
+		ok    bool
+	}{
+		{"now64(3)", 3, true},
+		{"now64(9)", 9, true},
+		{"now64(0)", 0, true}, // parses, but the caller rejects scale < 3
+		{"now64()", 3, true},  // the function's own default
+		{"now64(3, 'UTC')", 3, true},
+		{"NOW64(3)", 3, true},
+		{" now64(3) ", 3, true},
+		{"now()", 0, false},
+		{"", 0, false},
+		{"toDateTime64(now(), 3)", 0, false},
+		{"now64", 0, false},
+	}
+	for _, c := range cases {
+		scale, ok := now64Scale(c.expr)
+		if ok != c.ok || (ok && scale != c.scale) {
+			t.Errorf("now64Scale(%q) = (%d,%v), want (%d,%v)", c.expr, scale, ok, c.scale, c.ok)
 		}
 	}
 }

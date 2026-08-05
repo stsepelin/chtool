@@ -222,20 +222,45 @@ func (s *SQLStore) verifyTable(ctx context.Context) error {
 			"records are ordered by (ts, seq), so a coarser ts loses the ordering seq only tiebreaks",
 			s.table, types["ts"])
 	}
-	// now() is second-precision even in a DateTime64(3) column, so it silently
-	// reintroduces exactly the collapse the precision check above prevents.
-	if !strings.Contains(strings.ToLower(defaults["ts"]), "now64") {
+	// The default has to be now64 at millisecond scale or finer. Both now() and
+	// now64(0) yield whole seconds even in a DateTime64(3) column, silently
+	// reintroducing exactly the collapse the precision check above prevents.
+	if scale, ok := now64Scale(defaults["ts"]); !ok || scale < 3 {
 		got := defaults["ts"]
 		if got == "" {
 			got = "none"
 		}
-		return fmt.Errorf("state table %s needs ts DEFAULT now64(3), found %s: "+
+		return fmt.Errorf("state table %s needs ts DEFAULT now64(3) or finer, found %s: "+
 			"appends omit ts so the server stamps it — with no default every record shares the zero "+
-			"timestamp, and with now() they share a whole-second one, so resume can read the wrong "+
-			"latest record",
+			"timestamp, and with a whole-second default (now() or now64(0)) they share one tick, so "+
+			"resume can read the wrong latest record",
 			s.table, got)
 	}
 	return nil
+}
+
+// now64Scale returns the scale of a now64(...) default expression. A bare
+// now64() is scale 3, which is the function's own default. Anything that is not
+// a now64 call reports !ok — including now(), which is whole seconds.
+func now64Scale(expr string) (scale int, ok bool) {
+	rest, found := strings.CutPrefix(strings.ToLower(strings.TrimSpace(expr)), "now64")
+	if !found {
+		return 0, false
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "(") || !strings.HasSuffix(rest, ")") {
+		return 0, false
+	}
+	args := strings.TrimSpace(rest[1 : len(rest)-1])
+	if args == "" {
+		return 3, true // now64() is millisecond scale
+	}
+	first, _, _ := strings.Cut(args, ",")
+	n, err := strconv.Atoi(strings.TrimSpace(first))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // dateTime64Precision extracts N from a DateTime64(N[, tz]) type.
