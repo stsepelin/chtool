@@ -80,12 +80,31 @@ func TestUseExistingTableVerification(t *testing.T) {
 		{
 			name:    "ts is not server-stamped",
 			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", ""}),
-			wantErr: []string{"no server-side default on ts", "now64(3)"},
+			wantErr: []string{"DEFAULT now64(3)", "found none"},
 		},
 		{
 			name:    "ts is too coarse to order by",
-			columns: replace("ts", scriptRow{"ts", "DateTime", "now()"}),
-			wantErr: []string{"DateTime64(3)", "ordered by"},
+			columns: replace("ts", scriptRow{"ts", "DateTime", "now64(3)"}),
+			wantErr: []string{"DateTime64(3) or finer", "ordered by"},
+		},
+		{
+			// now() is second-precision even in a DateTime64(3) column, so it
+			// silently collapses same-second appends onto one tick.
+			name:    "ts defaults to now() rather than now64()",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(3)", "now()"}),
+			wantErr: []string{"DEFAULT now64(3)", "whole-second"},
+		},
+		{
+			name:    "ts precision is coarser than milliseconds",
+			columns: replace("ts", scriptRow{"ts", "DateTime64(0)", "now64(0)"}),
+			wantErr: []string{"DateTime64(3) or finer"},
+		},
+		{
+			// A String seq sorts lexicographically: the tenth append would come
+			// back before the second.
+			name:    "seq cannot sort numerically",
+			columns: replace("seq", scriptRow{"seq", "String", ""}),
+			wantErr: []string{"seq of type String", "UInt64", "lexicographically"},
 		},
 	}
 	for _, c := range cases {
@@ -135,6 +154,51 @@ func TestVerifyUsesCurrentDatabaseForBareTable(t *testing.T) {
 	}
 	if !strings.Contains(conn.lastQuery, "currentDatabase()") {
 		t.Fatalf("a bare table should resolve via currentDatabase(), got: %s", conn.lastQuery)
+	}
+}
+
+// A table that exceeds the contract must not be rejected: finer ts precision
+// and a wider integer seq both order correctly.
+func TestUseExistingTableAcceptsStricterTypes(t *testing.T) {
+	cases := map[string]scriptRow{
+		"finer ts precision": {"ts", "DateTime64(9)", "now64(9)"},
+		"ts with a timezone": {"ts", "DateTime64(3, 'UTC')", "now64(3)"},
+	}
+	for name, override := range cases {
+		t.Run(name, func(t *testing.T) {
+			cols := append([]scriptRow(nil), validStateColumns()...)
+			for i := range cols {
+				if cols[i][0] == override[0] {
+					cols[i] = override
+				}
+			}
+			s := NewSQLStore(&fakeConn{columns: cols}, "audit.ops").UseExistingTable()
+			if err := s.Ensure(context.Background()); err != nil {
+				t.Fatalf("a table stricter than the contract should pass: %v", err)
+			}
+		})
+	}
+}
+
+func TestDateTime64Precision(t *testing.T) {
+	cases := []struct {
+		typ  string
+		prec int
+		ok   bool
+	}{
+		{"DateTime64(3)", 3, true},
+		{"DateTime64(9)", 9, true},
+		{"DateTime64(0)", 0, true},
+		{"DateTime64(3, 'UTC')", 3, true},
+		{"DateTime", 0, false},
+		{"String", 0, false},
+		{"DateTime64()", 0, false},
+	}
+	for _, c := range cases {
+		prec, ok := dateTime64Precision(c.typ)
+		if ok != c.ok || (ok && prec != c.prec) {
+			t.Errorf("dateTime64Precision(%q) = (%d,%v), want (%d,%v)", c.typ, prec, ok, c.prec, c.ok)
+		}
 	}
 }
 

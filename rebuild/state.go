@@ -3,6 +3,7 @@ package rebuild
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -206,18 +207,50 @@ func (s *SQLStore) verifyTable(ctx context.Context) error {
 			s.table, strings.Join(missing, ", "), strings.Join(RequiredColumns, ", "))
 	}
 
-	if !strings.Contains(types["ts"], "DateTime64") {
-		return fmt.Errorf("state table %s has ts of type %s, want DateTime64(3): "+
+	// seq must sort numerically. A String seq is the trap here: it compares
+	// lexicographically, so the tenth append sorts before the second.
+	if !strings.Contains(types["seq"], "Int") {
+		return fmt.Errorf("state table %s has seq of type %s, want UInt64: "+
+			"seq breaks ties on ts, and a non-integer seq sorts lexicographically ('10' before '2')",
+			s.table, types["seq"])
+	}
+
+	// ts must be at least millisecond precision. Coarser and same-millisecond
+	// appends collapse onto one tick, leaving only seq — which restarts per store.
+	if prec, ok := dateTime64Precision(types["ts"]); !ok || prec < 3 {
+		return fmt.Errorf("state table %s has ts of type %s, want DateTime64(3) or finer: "+
 			"records are ordered by (ts, seq), so a coarser ts loses the ordering seq only tiebreaks",
 			s.table, types["ts"])
 	}
-	if !strings.Contains(strings.ToLower(defaults["ts"]), "now") {
-		return fmt.Errorf("state table %s has no server-side default on ts (want DEFAULT now64(3)): "+
-			"appends omit ts so the server stamps it, so without a default every record shares the zero "+
-			"timestamp and resume can read the wrong latest record",
-			s.table)
+	// now() is second-precision even in a DateTime64(3) column, so it silently
+	// reintroduces exactly the collapse the precision check above prevents.
+	if !strings.Contains(strings.ToLower(defaults["ts"]), "now64") {
+		got := defaults["ts"]
+		if got == "" {
+			got = "none"
+		}
+		return fmt.Errorf("state table %s needs ts DEFAULT now64(3), found %s: "+
+			"appends omit ts so the server stamps it — with no default every record shares the zero "+
+			"timestamp, and with now() they share a whole-second one, so resume can read the wrong "+
+			"latest record",
+			s.table, got)
 	}
 	return nil
+}
+
+// dateTime64Precision extracts N from a DateTime64(N[, tz]) type.
+func dateTime64Precision(typ string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(typ), "DateTime64(")
+	if !ok {
+		return 0, false
+	}
+	digits, _, _ := strings.Cut(rest, ",")
+	digits = strings.TrimSuffix(strings.TrimSpace(digits), ")")
+	n, err := strconv.Atoi(strings.TrimSpace(digits))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // splitTable splits a possibly db-qualified, possibly backtick-quoted table name

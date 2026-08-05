@@ -765,8 +765,31 @@ func TestIntegrationUseExistingTableVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = NewSQLStore(conn, db+".no_default").UseExistingTable().Ensure(ctx)
-	if err == nil || !strings.Contains(err.Error(), "no server-side default on ts") {
+	if err == nil || !strings.Contains(err.Error(), "DEFAULT now64(3)") {
 		t.Fatalf("a ts without a server default should be refused, got: %v", err)
+	}
+
+	// now() is the subtle one: it is second-precision even in a DateTime64(3)
+	// column, so every same-second append would share a tick and ordering would
+	// fall back to per-store seq. Verified against the server, not assumed.
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".now_secs ("+
+		"ts DateTime64(3) DEFAULT now(), seq UInt64, op_id String, spec_hash String, "+
+		"phase String, status String, cursor String, detail String"+
+		") ENGINE = MergeTree ORDER BY (ts, seq)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewSQLStore(conn, db+".now_secs").UseExistingTable().Ensure(ctx); err == nil {
+		t.Fatal("DEFAULT now() should be refused: it collapses same-second appends onto one tick")
+	}
+	// Confirm the hazard is real on this server rather than only in our rules.
+	if err := conn.Exec(ctx, "INSERT INTO "+db+".now_secs (seq, op_id) VALUES (1, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Exec(ctx, "INSERT INTO "+db+".now_secs (seq, op_id) VALUES (2, 'a')"); err != nil {
+		t.Fatal(err)
+	}
+	if n := scalarU64(t, conn, "SELECT uniqExact(ts) FROM "+db+".now_secs"); n != 1 {
+		t.Logf("note: the two now() appends landed on different seconds (%d distinct ts)", n)
 	}
 
 	// The conforming table from the documented DDL passes.
