@@ -181,11 +181,11 @@ if err := migrate.UpContext(ctx, migrations, dsn); err != nil {
 ```
 
 `UpContext` / `StepsContext` return `ctx.Err()` immediately if the context is
-already done, and on cancellation mid-run they ask golang-migrate to stop at its
-next safe break point — **after the in-flight migration finishes**. So a run
-stops *between* migrations, **never mid-statement**. That is the semantics you
-want on ClickHouse anyway: DDL is non-transactional, and killing it mid-statement
-is exactly how you get the dirty state `Force` exists to repair.
+already done, and otherwise drive the sequence **one migration at a time**,
+checking the context between them. So a run stops *between* migrations, **never
+mid-statement**. That is the semantics you want on ClickHouse anyway: DDL is
+non-transactional, and killing it mid-statement is exactly how you get the dirty
+state `Force` exists to repair.
 
 A cancelled run therefore lands mid-sequence and returns an error wrapping both
 `ErrStoppedEarly` and `ctx.Err()` — re-check with `Version` to see where. A
@@ -195,12 +195,16 @@ cancellation that races with normal completion reports the same way, so treat
 `ForceContext` / `VersionContext` honour `ctx` only before their call begins:
 each is a single metadata operation with no safe mid-point to stop at.
 
-> **Cancelling under `-race`** reports a data race inside golang-migrate
-> (v4.19.1) — `Migrate.stop()` reads and writes the unsynchronised
-> `isGracefulStop` from two goroutines, so merely using `GracefulStop` trips the
-> detector. It is benign for correctness (the flag is only ever set to true, and
-> whichever goroutine observes it halts the run), but a suite running with
-> `-race` will see the report. It is upstream's to fix.
+**Why stepping, and not golang-migrate's `GracefulStop`?** Because signalling
+`GracefulStop` is a data race: `Migrate.stop()` reads and writes the
+unsynchronised `isGracefulStop` from two goroutines (v4.19.1). It is benign in
+effect, but it would fire the race detector in any consumer that cancels a
+migration under `-race`. Stepping reaches the same break points without touching
+that flag, at one cost worth knowing: a **cancellable** run takes golang-migrate's
+migration lock per migration rather than once for the whole sequence, so a second
+migrator could interleave between steps. A non-cancellable context (i.e. every
+non-`Context` function here) skips stepping and runs the sequence in a single
+locked call, exactly as before.
 
 > This is the only subpackage that imports `golang-migrate`.
 

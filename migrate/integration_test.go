@@ -16,6 +16,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	migrate "github.com/golang-migrate/migrate/v4"
 	chtool "github.com/stsepelin/chtool"
 )
 
@@ -135,18 +136,6 @@ func TestIntegrationErrNoChangeIsSentinel(t *testing.T) {
 // migration finishes, later ones never start, the schema is left mid-sequence
 // and — crucially — NOT dirty, because nothing was killed mid-statement.
 func TestIntegrationUpContextStopsBetweenMigrations(t *testing.T) {
-	if raceDetectorEnabled {
-		// golang-migrate v4.19.1 has an internal data race on the unsynchronised
-		// Migrate.isGracefulStop bool: both runMigrations and the readUp producer
-		// goroutine call stop(), which reads it and writes it after receiving on
-		// GracefulStop. Using GracefulStop at all trips the detector.
-		//
-		// It is benign for correctness — the flag is only ever set true, and
-		// either goroutine observing it halts the run (readUp returning closes
-		// the channel runMigrations ranges over) — but it is upstream's to fix,
-		// so this test cannot run under -race.
-		t.Skip("upstream data race in golang-migrate's GracefulStop; see comment")
-	}
 	dsn, cleanup := scratchDB(t, "chtool_it_migrate_ctx")
 	defer cleanup()
 
@@ -212,5 +201,47 @@ func TestIntegrationUpContextStopsBetweenMigrations(t *testing.T) {
 	}
 	if v, dirty, _ := Version(fsys, dsn); v != 3 || dirty {
 		t.Fatalf("after resume want version 3 clean, got %d dirty=%v", v, dirty)
+	}
+}
+
+// A cancellable ctx routes Steps through the one-at-a-time path, which must
+// stay behaviourally identical to a single m.Steps(n): same end version, and
+// the same short-limit error when the caller asks for more than exists.
+func TestIntegrationStepsContextMatchesSteps(t *testing.T) {
+	dsn, cleanup := scratchDB(t, "chtool_it_stepsctx")
+	defer cleanup()
+	fsys := migrationsFS() // two migrations
+
+	// A live (never-cancelled) ctx: the stepping path, not the fast path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := StepsContext(ctx, fsys, dsn, 1); err != nil {
+		t.Fatalf("StepsContext(+1): %v", err)
+	}
+	if v, dirty, _ := Version(fsys, dsn); v != 1 || dirty {
+		t.Fatalf("after +1 want version 1 clean, got %d dirty=%v", v, dirty)
+	}
+
+	// Asking for more than remains reports short, exactly as m.Steps(n) does,
+	// and still applies what it could.
+	err := StepsContext(ctx, fsys, dsn, 5)
+	var short migrate.ErrShortLimit
+	if !errors.As(err, &short) {
+		t.Fatalf("want ErrShortLimit when asking past the end, got %v", err)
+	}
+	if short.Short != 4 {
+		t.Fatalf("want 4 short (1 of 5 applied), got %d", short.Short)
+	}
+	if v, dirty, _ := Version(fsys, dsn); v != 2 || dirty {
+		t.Fatalf("the applicable migration should still have run: version %d dirty=%v", v, dirty)
+	}
+
+	// Reverting works through the same path.
+	if err := StepsContext(ctx, fsys, dsn, -1); err != nil {
+		t.Fatalf("StepsContext(-1): %v", err)
+	}
+	if v, _, _ := Version(fsys, dsn); v != 1 {
+		t.Fatalf("after -1 want version 1, got %d", v)
 	}
 }

@@ -14,8 +14,7 @@
 // statement already in flight. What UpContext and StepsContext do is:
 //
 //   - return ctx.Err() immediately if ctx is already done, before any work;
-//   - on cancellation mid-run, ask golang-migrate to stop at its next safe
-//     break point — that is, after the in-flight migration finishes.
+//   - drive the sequence one migration at a time, checking ctx between them.
 //
 // So a run stops BETWEEN migrations, never mid-statement. That is the semantics
 // you want on ClickHouse anyway: DDL is non-transactional, and killing it
@@ -31,19 +30,21 @@
 // ForceContext and VersionContext honour ctx only before their call begins:
 // each is a single metadata operation with no safe mid-point to stop at.
 //
-// # Cancellation trips the race detector
+// # Why not GracefulStop
 //
-// Cancelling a run under -race reports a data race inside golang-migrate
-// (v4.19.1), not in this package: Migrate.stop() reads and writes the
-// unsynchronised Migrate.isGracefulStop from both the migration-running
-// goroutine and the read-ahead producer goroutine. Merely using GracefulStop is
-// enough to trip it.
+// golang-migrate offers GracefulStop for exactly this, and it is deliberately
+// unused here: Migrate.stop() reads and writes the unsynchronised
+// Migrate.isGracefulStop from both the migration-running goroutine and the
+// read-ahead producer goroutine, so signalling it is a data race (v4.19.1).
+// Benign in effect — the flag is only ever set to true — but it would fire the
+// race detector in any consumer that cancels a migration under -race.
 //
-// It is benign for correctness — the flag is only ever set to true, and whichever
-// goroutine observes it halts the run (the producer returning closes the channel
-// the runner ranges over) — but a consumer whose own suite runs with -race will
-// see the report. If that matters, do not cancel migrations under -race until
-// the fix lands upstream.
+// Stepping avoids the flag entirely and reaches the same break points, at one
+// cost worth knowing: a cancellable run takes golang-migrate's migration lock
+// per migration rather than once for the whole sequence, so a second migrator
+// could interleave between steps. A non-cancellable ctx (context.Background,
+// and so every non-Context function here) skips stepping and runs the sequence
+// in a single locked call, exactly as before.
 package migrate
 
 import (
@@ -52,6 +53,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
+	"os"
 	"strings"
 
 	// clickhouse-go registers the "clickhouse" database/sql driver the
@@ -98,10 +100,14 @@ func Up(fsys fs.FS, dsn string) error { return UpContext(context.Background(), f
 // is cancelled (see the package docs on Cancellation).
 func UpContext(ctx context.Context, fsys fs.FS, dsn string) error {
 	return withContext(ctx, fsys, dsn, func(m *migrate.Migrate) error {
-		if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-			return err
+		// Not cancellable: run the whole sequence in one call, under one lock.
+		if ctx.Done() == nil {
+			if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+				return err
+			}
+			return nil
 		}
-		return nil
+		return stepAll(ctx, m)
 	})
 }
 
@@ -115,10 +121,14 @@ func Steps(fsys fs.FS, dsn string, n int) error {
 // migrations if ctx is cancelled (see the package docs on Cancellation).
 func StepsContext(ctx context.Context, fsys fs.FS, dsn string, n int) error {
 	return withContext(ctx, fsys, dsn, func(m *migrate.Migrate) error {
-		if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-			return err
+		// Not cancellable: run the whole sequence in one call, under one lock.
+		if ctx.Done() == nil {
+			if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+				return err
+			}
+			return nil
 		}
-		return nil
+		return stepN(ctx, m, n)
 	})
 }
 
@@ -170,47 +180,77 @@ func with(fsys fs.FS, dsn string, fn func(*migrate.Migrate) error) error {
 	return fn(m)
 }
 
-// withContext runs fn with a watcher that converts ctx cancellation into
-// golang-migrate's GracefulStop, which halts the run after the in-flight
-// migration completes. A gracefully stopped run reports no error of its own, so
-// cancellation is detected here and surfaced as ErrStoppedEarly.
+// withContext is with, refusing to start at all on an already-done ctx.
 func withContext(ctx context.Context, fsys fs.FS, dsn string, fn func(*migrate.Migrate) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m, err := New(fsys, dsn)
-	if err != nil {
-		return err
-	}
-	defer func() { _, _ = m.Close() }()
+	return with(fsys, dsn, fn)
+}
 
-	// Registered after the Close defer, so it runs first: the watcher is torn
-	// down before the Migrate it references is closed.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			// GracefulStop is buffered (cap 1); the default keeps this
-			// non-blocking when a stop is already pending.
-			select {
-			case m.GracefulStop <- true:
-			default:
+// stopped wraps a cancellation so callers can tell why the run ended and what
+// to do about it.
+func stopped(ctxErr error) error {
+	return fmt.Errorf("%w: %w; it stopped between migrations, so the recorded version may be mid-sequence — re-check with Version",
+		ErrStoppedEarly, ctxErr)
+}
+
+// stepAll applies every pending migration one at a time, checking ctx between
+// them. Driving the sequence a migration at a time is what makes cancellation
+// possible without golang-migrate's GracefulStop, whose stop flag it races on
+// (see the package docs). The break points are identical either way: a
+// migration is never interrupted once it has started.
+func stepAll(ctx context.Context, m *migrate.Migrate) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return stopped(err)
+		}
+		switch err := m.Steps(1); {
+		case err == nil:
+		case exhausted(err):
+			return nil
+		default:
+			return err
+		}
+	}
+}
+
+// stepN applies (n>0) or reverts (n<0) n migrations one at a time, checking ctx
+// between them. Running short reports what a single m.Steps(n) would have: the
+// upstream error when nothing moved, ErrShortLimit when only some did.
+func stepN(ctx context.Context, m *migrate.Migrate, n int) error {
+	step, count := 1, n
+	if n < 0 {
+		step, count = -1, -n
+	}
+	for applied := range count {
+		if err := ctx.Err(); err != nil {
+			return stopped(err)
+		}
+		switch err := m.Steps(step); {
+		case err == nil:
+		case errors.Is(err, migrate.ErrNoChange):
+			return nil
+		case exhausted(err):
+			if applied == 0 {
+				return err
 			}
-		case <-done:
+			return migrate.ErrShortLimit{Short: uint(count - applied)}
+		default:
+			return err
 		}
-	}()
-
-	runErr := fn(m)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		stopped := fmt.Errorf("%w: %w; it stopped between migrations, so the recorded version may be mid-sequence — re-check with Version",
-			ErrStoppedEarly, ctxErr)
-		if runErr != nil {
-			return errors.Join(stopped, runErr)
-		}
-		return stopped
 	}
-	return runErr
+	return nil
+}
+
+// exhausted reports whether err means the source ran out of migrations rather
+// than that something went wrong.
+func exhausted(err error) bool {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, migrate.ErrNoChange) {
+		return true
+	}
+	var short migrate.ErrShortLimit
+	return errors.As(err, &short)
 }
 
 func normalizeDSN(dsn string) (string, error) {
