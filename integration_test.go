@@ -43,3 +43,23 @@ func TestIntegrationOpenAndPing(t *testing.T) {
 		t.Fatal("empty server version")
 	}
 }
+
+// WaitReady returns as soon as the server can actually serve a query.
+func TestIntegrationWaitReady(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Probe first so an unreachable server skips rather than burning the budget.
+	conn, err := Open(ctx, itDSN())
+	if err != nil {
+		if os.Getenv("CHTOOL_REQUIRE_CH") != "" {
+			t.Fatalf("ClickHouse required (CHTOOL_REQUIRE_CH) but unreachable at %s: %v", itDSN(), err)
+		}
+		t.Skipf("no ClickHouse at %s: %v", itDSN(), err)
+	}
+	conn.Close()
+
+	if err := WaitReady(ctx, itDSN()); err != nil {
+		t.Fatalf("WaitReady against a live server: %v", err)
+	}
+}

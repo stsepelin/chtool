@@ -35,6 +35,15 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
+      # chtest is a separate module, so the steps above do not reach it.
+      - name: go vet (chtest module)
+        run: go vet ./...
+        working-directory: chtest
+      - name: golangci-lint (chtest module)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          working-directory: chtest
 
   build-test:
     name: Build & unit tests
@@ -48,7 +57,13 @@ jobs:
       - name: go.mod tidy
         run: |
           go mod tidy
-          git diff --exit-code -- go.mod go.sum
+          # --porcelain also catches a generated-but-untracked go.sum, which
+          # git diff would silently pass.
+          if [ -n "$(git status --porcelain -- go.mod go.sum)" ]; then
+            echo "go.mod/go.sum are not tidy or not committed:"
+            git status --short -- go.mod go.sum
+            exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Unit tests (race + coverage)
@@ -61,6 +76,42 @@ jobs:
           name: coverage
           path: coverage.out
           if-no-files-found: error
+
+  chtest:
+    name: chtest module (nested)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: chtest/go.mod
+          check-latest: true
+      - name: go.mod tidy
+        run: |
+          go mod tidy
+          # --porcelain also catches a generated-but-untracked go.sum, which
+          # git diff would silently pass.
+          if [ -n "$(git status --porcelain -- go.mod go.sum)" ]; then
+            echo "go.mod/go.sum are not tidy or not committed:"
+            git status --short -- go.mod go.sum
+            exit 1
+          fi
+        working-directory: chtest
+      # Guards the reason chtest is a separate module: its Docker/testcontainers
+      # dependencies must never reach the main module's build graph.
+      - name: Assert main module stays dependency-light
+        run: |
+          if go list -deps ./... | grep -qiE 'testcontainers|moby/|docker/docker|docker/go-connections'; then
+            echo "main module now builds Docker/testcontainers packages"; exit 1
+          fi
+          echo "main module build graph is clean"
+      - name: Build
+        run: go build ./...
+        working-directory: chtest
+      # Starts a real container via testcontainers; the runner provides Docker.
+      - name: Tests
+        run: go test -race ./...
+        working-directory: chtest
 
   integration:
     name: Integration tests (real ClickHouse)

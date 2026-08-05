@@ -21,8 +21,22 @@ type Record struct {
 
 // StateStore persists rebuild progress so a run resumes after any interruption.
 // It is an append-only log: Append adds an entry, Records returns an op's
-// entries oldest-first. Implement it over any store; a ClickHouse-backed
-// default is provided by NewSQLStore.
+// entries oldest-first. A ClickHouse-backed default is provided by NewSQLStore.
+//
+// Records MUST return an op's entries in append order. That ordering is load
+// bearing: the orchestrator reads the last record as the current phase and
+// derives completed backfill chunks from the log, so an implementation whose
+// same-tick appends read back in undefined order can rewind a cursor, re-run a
+// chunk, and double-count rows into an AggregatingMergeTree.
+//
+// One rebuild is expected to be driven by one orchestrator at a time, so this
+// contract is about a single writer's appends. Two processes racing on the same
+// op are not ordered against each other by SQLStore (see UseExistingTable), and
+// are not a supported way to run a rebuild.
+//
+// Prefer NewSQLStore over a fresh implementation. To keep rebuild state in your
+// own wider table (extra audit columns, say), point it at that table and call
+// UseExistingTable rather than reimplementing this interface.
 type StateStore interface {
 	Ensure(ctx context.Context) error
 	Append(ctx context.Context, r Record) error
@@ -32,12 +46,18 @@ type StateStore interface {
 
 const DefaultTable = "_chtool_ops"
 
+// RequiredColumns are the columns SQLStore reads and writes. A caller-owned
+// table must provide them; any further columns are ignored (see
+// SQLStore.UseExistingTable).
+var RequiredColumns = []string{"ts", "seq", "op_id", "spec_hash", "phase", "status", "cursor", "detail"}
+
 type SQLStore struct {
-	conn    Conn
-	table   string
-	mu      sync.Mutex
-	ensured bool
-	seq     atomic.Uint64 // tiebreaks appends that share a ts within one process
+	conn     Conn
+	table    string
+	mu       sync.Mutex
+	ensured  bool
+	external bool          // table is caller-owned; never run DDL
+	seq      atomic.Uint64 // tiebreaks appends that share a ts within one process
 }
 
 // NewSQLStore returns a store writing to table (may be db-qualified, e.g.
@@ -49,9 +69,52 @@ func NewSQLStore(conn Conn, table string) *SQLStore {
 	return &SQLStore{conn: conn, table: table}
 }
 
-// Ensure creates the state table if absent. The DDL runs at most once per store
-// after it first succeeds, keeping it off the per-append hot path.
+// UseExistingTable declares the state table caller-owned: Ensure becomes a no-op
+// and the store never runs DDL. Returns the store for chaining.
+//
+// Use it to keep rebuild state in a wider table you manage — e.g. one that also
+// carries your own operator audit columns. SQLStore already works against such a
+// superset: it names columns explicitly in both its INSERT and its SELECT, so
+// extra columns are untouched (they must be nullable or have defaults, since
+// SQLStore does not write them). Without this option the DDL is order-dependent:
+// whichever of Ensure or your own migration runs first wins, and if Ensure wins
+// it creates the narrow table and your audit inserts then fail.
+//
+// Reimplementing StateStore instead is a trap worth naming: a copy that drops
+// the seq tiebreaker lets same-millisecond appends read back in undefined order,
+// so the orchestrator can resolve the wrong latest record, rewind a backfill
+// cursor, re-run a chunk, and double-count rows into an AggregatingMergeTree —
+// silent sum inflation. Point this store at your table instead.
+//
+// The table must provide RequiredColumns with the same types and ordering
+// semantics as the DDL in Ensure:
+//
+//	ts        DateTime64(3) DEFAULT now64(3)  -- server-stamped; do not bind a client time
+//	seq       UInt64                          -- per-store tiebreaker, see below
+//	op_id     String
+//	spec_hash String
+//	phase     String
+//	status    String
+//	cursor    String
+//	detail    String
+//
+// ordered by (ts, seq), which reads back in append order for one store's
+// appends. seq counts per SQLStore, so it does not order two stores against
+// each other; what separates a resume from the run before it is the later ts,
+// not seq. Driving one rebuild from two orchestrators at once is unsupported
+// for this reason among others.
+func (s *SQLStore) UseExistingTable() *SQLStore {
+	s.external = true
+	return s
+}
+
+// Ensure creates the state table if absent, unless the table is caller-owned
+// (UseExistingTable), in which case it is a no-op. The DDL runs at most once per
+// store after it first succeeds, keeping it off the per-append hot path.
 func (s *SQLStore) Ensure(ctx context.Context) error {
+	if s.external {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ensured {

@@ -27,6 +27,7 @@ only what you need.
 - [`chtool/schema` — snapshot, drift, lint](#chtoolschema--snapshot-drift-lint)
 - [`chtool/structs` — struct ↔ column helpers](#chtoolstructs--struct--column-helpers)
 - [`chtool/rebuild` — online table rebuilds](#chtoolrebuild--online-table-rebuilds)
+- [`chtool/chtest` — a throwaway ClickHouse for tests](#chtoolchtest--a-throwaway-clickhouse-for-tests)
 - [ClickHouse Cloud](#clickhouse-cloud)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -64,6 +65,7 @@ go get github.com/stsepelin/chtool
 | `chtool/schema` | `…/chtool/schema` | Schema `Dump` + Cloud-aware `Normalize` + drift `Diff` + migration `Lint` | — |
 | `chtool/structs` | `…/chtool/structs` | Generic `Insert[T]`, `VerifyTags[T]`, `CreateDDL[T]` over `ch:`-tagged structs | — |
 | `chtool/rebuild` | `…/chtool/rebuild` | Online `AggregatingMergeTree` rebuild orchestrator | — |
+| `chtool/chtest` | `…/chtool/chtest` | Throwaway ClickHouse container for integration tests | **separate module** (testcontainers) |
 
 Full API reference: **[pkg.go.dev/github.com/stsepelin/chtool](https://pkg.go.dev/github.com/stsepelin/chtool)**.
 
@@ -95,6 +97,20 @@ owns `Close`.
 | Local dev | `clickhouse://localhost:9000/db` |
 | Cloud / remote | `clickhouse://user:pw@host:9440/db` (TLS auto-on, verified) |
 | Self-signed cert | `clickhouse://…?secure=true&skip_verify=true` (explicit opt-in) |
+
+`WaitReady(ctx, dsn)` blocks until the server can serve a query — the gate to put
+behind a compose `depends_on` or a freshly started container. A server can accept
+a connection while still starting up, so readiness is proved with a real query
+rather than a ping alone. Bound it with a deadline; the error wraps `ctx.Err()`
+and carries the last connection failure.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+defer cancel()
+if err := chtool.WaitReady(ctx, dsn); err != nil {
+    log.Fatal(err)
+}
+```
 
 ---
 
@@ -131,11 +147,64 @@ enforce house rules before they run.
 
 | Function | Purpose |
 |---|---|
-| `Up(fsys, dsn)` | Apply all pending migrations |
-| `Steps(fsys, dsn, n)` | Apply (`n>0`) or revert (`n<0`) `n` migrations |
-| `Force(fsys, dsn, version)` | Set the version without running SQL (dirty-state recovery) |
-| `Version(fsys, dsn)` | Current `(version, dirty, err)` |
+| `Up(fsys, dsn)` / `UpContext(ctx, …)` | Apply all pending migrations |
+| `Steps(fsys, dsn, n)` / `StepsContext(ctx, …)` | Apply (`n>0`) or revert (`n<0`) `n` migrations |
+| `Force(fsys, dsn, version)` / `ForceContext(ctx, …)` | Set the version without running SQL (dirty-state recovery) |
+| `Version(fsys, dsn)` / `VersionContext(ctx, …)` | Current `(version, dirty, err)` |
+| `Create(dir, name)` | Scaffold the next `NNNNNN_name.up.sql` (gapless, `O_EXCL`) |
 | `New(fsys, dsn)` | Build a `*migrate.Migrate` for advanced use |
+
+`Create` puts the constructor next to the validator: it numbers one past the
+highest existing migration so the run stays gapless for `schema.Lint`, accepts
+only a lowercase `[a-z0-9_]` slug (which also makes `..` and path separators
+unrepresentable), and uses `O_EXCL` so it never truncates an existing migration.
+It writes only the `.up.sql` — a `.down.sql` is optional, and an empty one is
+worse than none, since ClickHouse rejects an empty statement at runtime.
+
+### Cancellation
+
+The `Context` variants bound a run — but it is worth being precise about what
+that buys you, because golang-migrate exposes no `context.Context` at all.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+
+if err := migrate.UpContext(ctx, migrations, dsn); err != nil {
+    if errors.Is(err, migrate.ErrStoppedEarly) {
+        // Stopped between migrations. Find out where we landed.
+        v, dirty, _ := migrate.Version(migrations, dsn)
+        log.Printf("stopped at version %d (dirty=%v)", v, dirty)
+    }
+    return err
+}
+```
+
+`UpContext` / `StepsContext` return `ctx.Err()` immediately if the context is
+already done, and otherwise drive the sequence **one migration at a time**,
+checking the context between them. So a run stops *between* migrations, **never
+mid-statement**. That is the semantics you want on ClickHouse anyway: DDL is
+non-transactional, and killing it mid-statement is exactly how you get the dirty
+state `Force` exists to repair.
+
+A cancelled run therefore lands mid-sequence and returns an error wrapping both
+`ErrStoppedEarly` and `ctx.Err()` — re-check with `Version` to see where. A
+cancellation that races with normal completion reports the same way, so treat
+`ErrStoppedEarly` as *"re-check"*, not *"nothing was applied"*.
+
+`ForceContext` / `VersionContext` honour `ctx` only before their call begins:
+each is a single metadata operation with no safe mid-point to stop at.
+
+**Why stepping, and not golang-migrate's `GracefulStop`?** Because signalling
+`GracefulStop` is a data race: `Migrate.stop()` reads and writes the
+unsynchronised `isGracefulStop` from two goroutines (v4.19.1). It is benign in
+effect, but it would fire the race detector in any consumer that cancels a
+migration under `-race`. Stepping reaches the same break points without touching
+that flag, at one cost worth knowing: a **cancellable** run takes golang-migrate's
+migration lock per migration rather than once for the whole sequence, so a second
+migrator could interleave between steps. A non-cancellable context (i.e. every
+non-`Context` function here) skips stepping and runs the sequence in a single
+locked call, exactly as before.
 
 > This is the only subpackage that imports `golang-migrate`.
 
@@ -274,7 +343,7 @@ o := &rebuild.Orchestrator{
     Spec:  spec,
     Store: rebuild.NewSQLStore(conn, "analytics._chtool_ops"),
     Log:   func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
-    // ReconcileGuard: func() error { ... } // optional gate run before cutover
+    // ReconcileGuard: rebuild.CompanionInFS(migrations, spec), // optional gate before cutover
 }
 
 _ = rebuild.Plan(ctx, o, false)                                  // read-only preflight + cost probe
@@ -291,6 +360,13 @@ _ = rebuild.Cutover(ctx, o, time.Now())                          // the swap
 | `Status(ctx, o)` | Print the current phase and backfill progress. |
 | `Abort(ctx, o)` | Tear down `*_v2` objects before cutover; never touches the live pipeline. |
 | `Cutover(ctx, o, now)` | Drop MVs → `RENAME` (old → dated backup, v2 → live) → recreate MVs. |
+
+`CompanionInFS(fsys, spec)` is a ready-made `ReconcileGuard` that refuses cutover
+unless the spec's `companion_migration` is present in the given `fs.FS` — pass
+the same `embed.FS` the binary migrates from. That is the point: the guarantee
+you want is that the *running binary* carries the companion migration, which an
+`os.Stat` on a working-directory-relative path does not check. It fails closed —
+a spec with no `companion_migration` is an error, not a silent pass.
 
 The connection's **default database must be the rebuild target's database** — your
 `new_ddl.sql` runs verbatim (only the table name is retargeted, not the database).
@@ -371,6 +447,64 @@ implement the interface yourself to journal progress anywhere else.
 
 ---
 
+## `chtool/chtest` — a throwaway ClickHouse for tests
+
+Starting a scratch ClickHouse is the boilerplate every consumer ends up writing
+— image pin, readiness polling, cleanup — and then drifting apart on. `chtest`
+is that helper, once.
+
+It is a **separate Go module**, so testcontainers-go and the Docker SDK never
+enter the dependency graph of the main `chtool` module. Require it only from the
+code that runs tests:
+
+```bash
+go get github.com/stsepelin/chtool/chtest
+```
+
+```go
+func TestSomething(t *testing.T) {
+    dsn := chtest.Start(t)                       // container + readiness + t.Cleanup
+    conn, _ := chtool.Open(t.Context(), dsn)
+    // ...
+}
+```
+
+For a package with several integration tests, share one container from
+`TestMain` — repeatedly creating and destroying servers is what makes
+ClickHouse's native handshake time out intermittently:
+
+```go
+func TestMain(m *testing.M) {
+    dsn, cleanup, err := chtest.StartMain()
+    if err != nil {
+        log.Fatal(err)
+    }
+    testDSN = dsn
+    code := m.Run()
+    cleanup()          // before os.Exit, which skips defers
+    os.Exit(code)
+}
+```
+
+| Symbol | Purpose |
+|---|---|
+| `Start(tb)` | Container + readiness wait + `tb.Cleanup`; returns a DSN |
+| `StartMain()` | Same, for `TestMain`: returns `(dsn, cleanup, err)` |
+| `WithDatabase(dsn, db)` | Repoint a DSN at another database (create it yourself) |
+| `Image` | The one image pin everyone shares |
+| `Env()` | The environment a scratch OSS container needs (see below) |
+
+**It composes with CI rather than replacing it.** If `CHTOOL_TEST_DSN` is set,
+no container is started and that DSN is handed back — so the same test code runs
+against a service container in CI and a throwaway container on a laptop.
+
+**The gotcha `Env()` encodes:** the official image's entrypoint disables network
+access for the `default` user unless told otherwise, logging *"neither
+CLICKHOUSE_USER nor CLICKHOUSE_PASSWORD is set, disabling network access for
+user 'default'"*. The container then looks healthy — a `clickhouse-client`
+health check passes over the local socket — while every connection from outside
+is refused. Setting `CLICKHOUSE_DB` alone does **not** fix it.
+
 ## ClickHouse Cloud
 
 `chtool` targets Cloud as a first-class case:
@@ -399,13 +533,28 @@ unreachable, and each uses its own scratch database that it drops afterward:
 
 ```bash
 # e.g. against a local container:
-#   docker run -d --name ch -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server
+#   docker run -d --name ch -p 9000:9000 -p 8123:8123 \
+#     -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:24.8
 CHTOOL_TEST_DSN=clickhouse://localhost:9000/default go test -tags integration ./...
 ```
 
+Note the `CLICKHOUSE_SKIP_USER_SETUP=1` — without it the container refuses
+connections from outside while still looking healthy. [`chtool/chtest`](#chtoolchtest--a-throwaway-clickhouse-for-tests)
+encodes that (and the readiness wait) so you do not have to.
+
+`chtest` is a separate module, so its own tests run separately:
+
+```bash
+cd chtest && go test ./...          # starts a real container
+cd chtest && go test -short ./...   # skips it
+```
+
 CI runs unit tests (with `-race` + coverage), the integration suite against a
-ClickHouse service container, `golangci-lint`, and `govulncheck` on every push and
-PR — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+ClickHouse service container, the nested `chtest` module, `golangci-lint`, and
+`govulncheck` on every push and PR — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). One CI step asserts the
+main module's build graph never picks up Docker/testcontainers packages, which
+is the whole reason `chtest` is a separate module.
 
 ## Contributing
 

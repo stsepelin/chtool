@@ -656,3 +656,70 @@ func TestIntegrationPreflightMissingSourceColumn(t *testing.T) {
 		}
 	}
 }
+
+// An embedder can keep rebuild state in its own wider table: SQLStore points at
+// it with UseExistingTable, runs no DDL, and coexists with the embedder's extra
+// audit columns. This is the supported alternative to reimplementing StateStore
+// (a copy that drops the seq tiebreaker can double-count a backfill chunk).
+func TestIntegrationStateStoreExistingSupersetTable(t *testing.T) {
+	const db = "chtool_it_superset"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	// The embedder owns the DDL: chtool's columns plus its own audit columns.
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".ops ("+
+		"ts DateTime64(3) DEFAULT now64(3), seq UInt64, op_id String, spec_hash String, "+
+		"phase String, status String, cursor String, detail String, "+
+		"command String, os_user String, version_from UInt64, version_to UInt64, error String"+
+		") ENGINE = MergeTree ORDER BY (ts, seq)"); err != nil {
+		t.Fatalf("embedder DDL: %v", err)
+	}
+
+	store := NewSQLStore(conn, db+".ops").UseExistingTable()
+	// Ensure is a no-op; the wide table must survive it.
+	if err := store.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []Record{
+		{OpID: "rebuild:s", SpecHash: "H", Phase: phaseCreated, Status: "done"},
+		{OpID: "rebuild:s", SpecHash: "H", Phase: phaseLagDrained, Status: "done"},
+		{OpID: "rebuild:s", SpecHash: "H", Phase: phaseValidated, Status: "done"},
+	} {
+		if err := store.Append(ctx, r); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	// The embedder's own audit row lands in the same table — this is the insert
+	// that used to fail when Ensure won the race and created the narrow schema.
+	if err := conn.Exec(ctx, "INSERT INTO "+db+".ops (seq, op_id, phase, command, os_user, version_from, version_to) "+
+		"VALUES (?,?,?,?,?,?,?)", uint64(999), "audit:migrate", "applied", "chctl up", "alice", uint64(41), uint64(42)); err != nil {
+		t.Fatalf("embedder audit insert: %v", err)
+	}
+
+	// chtool reads back only its op, in append order, terminal phase last.
+	recs, err := store.Records(ctx, "rebuild:s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("expected 3 records, got %d: %+v", len(recs), recs)
+	}
+	if recs[len(recs)-1].Phase != phaseValidated {
+		t.Fatalf("terminal phase = %q, want %q", recs[len(recs)-1].Phase, phaseValidated)
+	}
+
+	// The audit columns are intact and untouched by chtool's writes.
+	if got := scalarStr(t, conn, "SELECT command FROM "+db+".ops WHERE op_id = 'audit:migrate'"); got != "chctl up" {
+		t.Fatalf("audit column lost: %q", got)
+	}
+	if got := scalarU64(t, conn, "SELECT count() FROM "+db+".ops WHERE command != ''"); got != 1 {
+		t.Fatalf("chtool rows should leave audit columns at their defaults, got %d non-empty", got)
+	}
+	// The table still has every audit column (no narrow table was created).
+	if got := scalarU64(t, conn,
+		"SELECT count() FROM system.columns WHERE database = '"+db+"' AND table = 'ops'"); got != 13 {
+		t.Fatalf("expected the 13-column superset table to survive, got %d columns", got)
+	}
+}

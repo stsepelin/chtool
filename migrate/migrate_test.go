@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"context"
+	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -15,6 +17,48 @@ func oneMigration() fstest.MapFS {
 	return fstest.MapFS{
 		"000001_init.up.sql":   {Data: []byte("CREATE TABLE t (x UInt8) ENGINE = MergeTree ORDER BY x")},
 		"000001_init.down.sql": {Data: []byte("DROP TABLE t")},
+	}
+}
+
+// An already-cancelled context must be reported before any connection is
+// attempted: against a dead DSN the error must be the ctx error, not a dial
+// failure. Without the precheck these would try to connect first.
+func TestContextVariantsCheckCtxBeforeWork(t *testing.T) {
+	fsys := oneMigration()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("Up", func(t *testing.T) {
+		if err := UpContext(ctx, fsys, deadDSN); !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	})
+	t.Run("Steps", func(t *testing.T) {
+		if err := StepsContext(ctx, fsys, deadDSN, 1); !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	})
+	t.Run("Force", func(t *testing.T) {
+		if err := ForceContext(ctx, fsys, deadDSN, 1); !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	})
+	t.Run("Version", func(t *testing.T) {
+		if _, _, err := VersionContext(ctx, fsys, deadDSN); !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	})
+
+	// Sanity: with a live context the same dead DSN fails to connect, so the
+	// assertions above really are the precheck and not a coincidence.
+	if err := UpContext(context.Background(), fsys, deadDSN); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("expected a connection error with a live ctx, got %v", err)
+	}
+}
+
+func TestErrStoppedEarlyIsDistinct(t *testing.T) {
+	if errors.Is(ErrStoppedEarly, ErrNoChange) {
+		t.Fatal("ErrStoppedEarly must not alias ErrNoChange")
 	}
 }
 

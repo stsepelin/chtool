@@ -2,7 +2,10 @@ package chtool
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsLocal(t *testing.T) {
@@ -29,6 +32,36 @@ func TestIsLocal(t *testing.T) {
 				t.Errorf("isLocal(%v) = %v, want %v", c.addrs, got, c.want)
 			}
 		})
+	}
+}
+
+// WaitReady must give up when ctx expires, and report both the ctx error (for
+// errors.Is) and the last connection failure (for the human reading the log).
+func TestWaitReadyGivesUpOnDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := WaitReady(ctx, "clickhouse://localhost:1/db")
+	if err == nil {
+		t.Fatal("expected WaitReady to fail against a dead port")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error should wrap the ctx error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "last attempt") {
+		t.Fatalf("error should carry the last connection failure, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("WaitReady overran its deadline by too much: %s", elapsed)
+	}
+}
+
+func TestWaitReadyRespectsAlreadyCancelledCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := WaitReady(ctx, "clickhouse://localhost:1/db"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
 	}
 }
 

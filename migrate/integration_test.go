@@ -16,6 +16,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	migrate "github.com/golang-migrate/migrate/v4"
 	chtool "github.com/stsepelin/chtool"
 )
 
@@ -54,6 +55,18 @@ func scratchDB(t *testing.T, name string) (dsn string, cleanup func()) {
 		_ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name)
 		admin.Close()
 	}
+}
+
+// openDSN opens a chtool connection to dsn for direct assertions.
+func openDSN(t *testing.T, dsn string) chtool.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := chtool.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dsn, err)
+	}
+	return conn
 }
 
 func migrationsFS() fstest.MapFS {
@@ -116,5 +129,119 @@ func TestIntegrationMigrateLifecycle(t *testing.T) {
 func TestIntegrationErrNoChangeIsSentinel(t *testing.T) {
 	if !errors.Is(ErrNoChange, ErrNoChange) {
 		t.Fatal("ErrNoChange should be usable with errors.Is")
+	}
+}
+
+// Cancelling mid-run must stop the sequence at a safe point: the in-flight
+// migration finishes, later ones never start, the schema is left mid-sequence
+// and — crucially — NOT dirty, because nothing was killed mid-statement.
+func TestIntegrationUpContextStopsBetweenMigrations(t *testing.T) {
+	dsn, cleanup := scratchDB(t, "chtool_it_migrate_ctx")
+	defer cleanup()
+
+	// 000001 takes ~2s; 000002 and 000003 are instant. Cancelling well inside
+	// 000001 lets it finish, then the run must halt before 000002.
+	fsys := fstest.MapFS{
+		"000001_slow.up.sql":    {Data: []byte("CREATE TABLE slow ENGINE = MergeTree ORDER BY tuple() AS SELECT sleepEachRow(0.2) AS s FROM numbers(10)")},
+		"000001_slow.down.sql":  {Data: []byte("DROP TABLE slow")},
+		"000002_two.up.sql":     {Data: []byte("CREATE TABLE two (x UInt8) ENGINE = MergeTree ORDER BY x")},
+		"000002_two.down.sql":   {Data: []byte("DROP TABLE two")},
+		"000003_three.up.sql":   {Data: []byte("CREATE TABLE three (x UInt8) ENGINE = MergeTree ORDER BY x")},
+		"000003_three.down.sql": {Data: []byte("DROP TABLE three")},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := UpContext(ctx, fsys, dsn)
+	elapsed := time.Since(start)
+
+	// It reports both why it stopped and that it stopped early.
+	if !errors.Is(err, ErrStoppedEarly) {
+		t.Fatalf("want ErrStoppedEarly, got %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the ctx error wrapped too, got %v", err)
+	}
+	// It waited for the in-flight migration rather than abandoning it mid-DDL.
+	if elapsed < time.Second {
+		t.Fatalf("returned after %s — it must let the in-flight migration finish, not abort mid-statement", elapsed)
+	}
+
+	// Landed mid-sequence, and not dirty: the whole point of stopping at a
+	// safe break point instead of killing a statement.
+	v, dirty, verr := Version(fsys, dsn)
+	if verr != nil {
+		t.Fatalf("Version after cancellation: %v", verr)
+	}
+	if dirty {
+		t.Fatalf("schema must not be dirty after a graceful stop (version %d)", v)
+	}
+	if v != 1 {
+		t.Fatalf("expected to stop after migration 1, got version %d", v)
+	}
+
+	// Concretely: 000001 applied, 000002/000003 never ran.
+	conn := openDSN(t, dsn)
+	defer conn.Close()
+	for tbl, want := range map[string]uint64{"slow": 1, "two": 0, "three": 0} {
+		var n uint64
+		if err := conn.QueryRow(context.Background(),
+			"SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = ?", tbl).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Errorf("table %s: count=%d, want %d", tbl, n, want)
+		}
+	}
+
+	// A resume completes the rest — the stop left a consistent state.
+	if err := Up(fsys, dsn); err != nil {
+		t.Fatalf("resume after cancellation: %v", err)
+	}
+	if v, dirty, _ := Version(fsys, dsn); v != 3 || dirty {
+		t.Fatalf("after resume want version 3 clean, got %d dirty=%v", v, dirty)
+	}
+}
+
+// A cancellable ctx routes Steps through the one-at-a-time path, which must
+// stay behaviourally identical to a single m.Steps(n): same end version, and
+// the same short-limit error when the caller asks for more than exists.
+func TestIntegrationStepsContextMatchesSteps(t *testing.T) {
+	dsn, cleanup := scratchDB(t, "chtool_it_stepsctx")
+	defer cleanup()
+	fsys := migrationsFS() // two migrations
+
+	// A live (never-cancelled) ctx: the stepping path, not the fast path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := StepsContext(ctx, fsys, dsn, 1); err != nil {
+		t.Fatalf("StepsContext(+1): %v", err)
+	}
+	if v, dirty, _ := Version(fsys, dsn); v != 1 || dirty {
+		t.Fatalf("after +1 want version 1 clean, got %d dirty=%v", v, dirty)
+	}
+
+	// Asking for more than remains reports short, exactly as m.Steps(n) does,
+	// and still applies what it could.
+	err := StepsContext(ctx, fsys, dsn, 5)
+	var short migrate.ErrShortLimit
+	if !errors.As(err, &short) {
+		t.Fatalf("want ErrShortLimit when asking past the end, got %v", err)
+	}
+	if short.Short != 4 {
+		t.Fatalf("want 4 short (1 of 5 applied), got %d", short.Short)
+	}
+	if v, dirty, _ := Version(fsys, dsn); v != 2 || dirty {
+		t.Fatalf("the applicable migration should still have run: version %d dirty=%v", v, dirty)
+	}
+
+	// Reverting works through the same path.
+	if err := StepsContext(ctx, fsys, dsn, -1); err != nil {
+		t.Fatalf("StepsContext(-1): %v", err)
+	}
+	if v, _, _ := Version(fsys, dsn); v != 1 {
+		t.Fatalf("after -1 want version 1, got %d", v)
 	}
 }

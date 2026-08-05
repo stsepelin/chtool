@@ -6,6 +6,64 @@ import (
 	"testing"
 )
 
+// UseExistingTable must suppress all DDL: the embedder owns the table, so
+// whichever of Ensure or their migration runs first must no longer matter.
+func TestSQLStoreUseExistingTableRunsNoDDL(t *testing.T) {
+	conn := &fakeConn{}
+	s := NewSQLStore(conn, "audit.ops").UseExistingTable()
+	ctx := context.Background()
+
+	if err := s.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(ctx, Record{OpID: "x", Phase: phaseCreated}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Records(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := countContains(conn.execs, "CREATE TABLE"); n != 0 {
+		t.Fatalf("caller-owned table must never get DDL, got %d CREATE statements: %v", n, conn.execs)
+	}
+	// It must still write, and still send the seq tiebreaker.
+	if n := countContains(conn.execs, "INSERT INTO audit.ops"); n != 1 {
+		t.Fatalf("expected one INSERT into the caller's table, got %v", conn.execs)
+	}
+	if !strings.Contains(conn.execs[0], "seq") {
+		t.Fatalf("INSERT must carry the seq tiebreaker: %s", conn.execs[0])
+	}
+}
+
+// The default (unowned) store still creates its table.
+func TestSQLStoreDefaultStillEnsures(t *testing.T) {
+	conn := &fakeConn{}
+	if err := NewSQLStore(conn, "ops").Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if countContains(conn.execs, "CREATE TABLE IF NOT EXISTS") != 1 {
+		t.Fatalf("default store should create its table, got %v", conn.execs)
+	}
+}
+
+// RequiredColumns must stay in sync with what Append writes and Records reads —
+// it is the contract a caller-owned superset table has to satisfy.
+func TestRequiredColumnsMatchQueries(t *testing.T) {
+	conn := &fakeConn{}
+	s := NewSQLStore(conn, "ops").UseExistingTable()
+	if err := s.Append(context.Background(), Record{OpID: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	insert := conn.execs[0]
+	for _, c := range RequiredColumns {
+		if c == "ts" {
+			continue // server-stamped via DEFAULT, deliberately not in the INSERT
+		}
+		if !strings.Contains(insert, c) {
+			t.Errorf("RequiredColumns lists %q but the INSERT does not write it: %s", c, insert)
+		}
+	}
+}
+
 // BUG 1 regression: Append must not bind ts, and the DDL must server-stamp it
 // via DEFAULT now64(3). Binding a Go time.Now() truncates to whole seconds and
 // collapses distinct phase records onto one tick, so the orchestrator's
