@@ -21,6 +21,31 @@
 // many integration tests, prefer StartMain from TestMain: repeatedly creating
 // and destroying servers is what makes ClickHouse's native handshake time out
 // intermittently under load.
+//
+// # Choosing the image
+//
+// Image is the shared default, and using it is the point: unmanaged pins
+// drifting apart across repos is the failure mode this package exists to stop.
+//
+// Tracking a specific server is not that failure mode, though. A repo that
+// deploys against a managed ClickHouse — or that generates a committed schema
+// artifact from a scratch container and diffs it against that server — needs to
+// match the version it deploys against, or it risks systematic false drift.
+// Deviating is therefore possible, but explicit and greppable:
+//
+//   - CHTOOL_TEST_IMAGE redirects the image the way CHTOOL_TEST_DSN redirects
+//     the whole server, so a CI matrix can vary it without code changes;
+//   - Options.Image (via StartWith or StartContainer) pins it in code, for a
+//     repo whose version is a deliberate, single-source-of-truth decision.
+//
+// Options.Image wins over the environment: an explicit argument should not be
+// overridden by an ambient variable. Whenever the image is not Image, it is
+// logged with where it came from, so an unexpected override shows up in test
+// output instead of being silent.
+//
+// Keep an override in exactly one place in the consuming repo. One pin that
+// deliberately tracks a server is a decision; the same pin copied into three
+// packages is the drift this package is trying to prevent.
 package chtest
 
 import (
@@ -40,13 +65,49 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// Image is the single pin every consumer shares. Drifting pins across repos is
-// the thing this package exists to stop; change it here and everyone moves.
+// Image is the default pin consumers share. Change it here and everyone who has
+// not deliberately overridden it moves together. See the package docs on
+// choosing the image before overriding it.
 const Image = "clickhouse/clickhouse-server:24.8"
 
-// DSNEnv is the environment variable that, when set, makes Start and StartMain
+// DSNEnv is the environment variable that, when set, makes the Start functions
 // hand back an existing server instead of starting a container.
 const DSNEnv = "CHTOOL_TEST_DSN"
+
+// ImageEnv is the environment variable that, when set, overrides Image.
+// Options.Image takes precedence over it.
+const ImageEnv = "CHTOOL_TEST_IMAGE"
+
+// Options configures a container. The zero value is the shared default.
+type Options struct {
+	// Image overrides both Image and ImageEnv. Set it when the version is a
+	// deliberate decision for the repo — tracking the managed server you deploy
+	// against, say — and keep it in one place.
+	Image string
+
+	// Logf receives progress, notably which image was used when it is not the
+	// default. Start and StartWith default it to the test's log; StartContainer
+	// leaves it nil, which discards.
+	Logf func(format string, args ...any)
+}
+
+func (o Options) logf(format string, args ...any) {
+	if o.Logf != nil {
+		o.Logf(format, args...)
+	}
+}
+
+// resolveImage returns the image to run and where it came from. An empty source
+// means the shared default, which is not worth announcing.
+func resolveImage(opts Options) (image, source string) {
+	if img := strings.TrimSpace(opts.Image); img != "" {
+		return img, "Options.Image"
+	}
+	if img := strings.TrimSpace(os.Getenv(ImageEnv)); img != "" {
+		return img, ImageEnv
+	}
+	return Image, ""
+}
 
 const (
 	nativePort = "9000/tcp"
@@ -81,7 +142,17 @@ func Env() map[string]string {
 // tests, share one via StartMain instead.
 func Start(tb testing.TB) string {
 	tb.Helper()
-	dsn, cleanup, err := StartMain()
+	return StartWith(tb, Options{})
+}
+
+// StartWith is Start with explicit options — typically Options.Image, to track
+// a specific server version. See the package docs on choosing the image.
+func StartWith(tb testing.TB, opts Options) string {
+	tb.Helper()
+	if opts.Logf == nil {
+		opts.Logf = tb.Logf
+	}
+	dsn, cleanup, err := StartContainer(opts)
 	if err != nil {
 		tb.Fatalf("chtest: %v", err)
 	}
@@ -107,7 +178,29 @@ func Start(tb testing.TB) string {
 // Note that cleanup must run before os.Exit, which does not run deferred
 // functions.
 func StartMain() (dsn string, cleanup func(), err error) {
+	return StartContainer(Options{})
+}
+
+// StartContainer starts a throwaway ClickHouse and returns its DSN with a
+// cleanup that terminates it. The returned cleanup is always non-nil and safe
+// to call even when err is non-nil, so it can be deferred immediately.
+//
+// This is the entry point behind Start, StartWith and StartMain, and it takes
+// no testing.TB deliberately: spinning a scratch server is a reasonable thing
+// for a tool to do — generating a schema artifact to diff against a live
+// server, say — not only for a test. Set Options.Logf to see progress.
+//
+// If CHTOOL_TEST_DSN is set, no container is started and that DSN is returned.
+func StartContainer(opts Options) (dsn string, cleanup func(), err error) {
+	image, source := resolveImage(opts)
+	if source != "" {
+		opts.logf("chtest: using image %s from %s (default is %s)", image, source, Image)
+	}
+
 	if existing := envDSN(); existing != "" {
+		if source != "" {
+			opts.logf("chtest: %s is set, so %s is being used and image %s is not started", DSNEnv, existing, image)
+		}
 		return existing, func() {}, nil
 	}
 
@@ -117,7 +210,7 @@ func StartMain() (dsn string, cleanup func(), err error) {
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		Started: true,
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        Image,
+			Image:        image,
 			ExposedPorts: []string{nativePort, httpPort},
 			Env:          Env(),
 			// Readiness is proved on both protocols. ForSQL opens the native
@@ -132,7 +225,7 @@ func StartMain() (dsn string, cleanup func(), err error) {
 		},
 	})
 	if err != nil {
-		return "", func() {}, fmt.Errorf("start clickhouse container (%s): %w", Image, err)
+		return "", func() {}, fmt.Errorf("start clickhouse container (%s): %w", image, err)
 	}
 	terminate := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

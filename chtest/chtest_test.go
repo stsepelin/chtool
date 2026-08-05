@@ -2,6 +2,8 @@ package chtest
 
 import (
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +42,70 @@ func TestWithDatabase(t *testing.T) {
 				t.Errorf("WithDatabase(%q, %q) = %q, want %q", c.dsn, c.db, got, c.want)
 			}
 		})
+	}
+}
+
+// The shared default must stay the default, an explicit option must win over an
+// ambient env var, and env must still work for a CI matrix.
+func TestResolveImagePrecedence(t *testing.T) {
+	cases := []struct {
+		name, optImage, envImage, want, wantSource string
+	}{
+		{"default when nothing is set", "", "", Image, ""},
+		{"env overrides the default", "", "ch:env", "ch:env", ImageEnv},
+		{"explicit option overrides the default", "ch:opt", "", "ch:opt", "Options.Image"},
+		{"explicit option beats the environment", "ch:opt", "ch:env", "ch:opt", "Options.Image"},
+		{"blank option falls through to env", "   ", "ch:env", "ch:env", ImageEnv},
+		{"blank env falls through to default", "", "   ", Image, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv(ImageEnv, c.envImage)
+			img, src := resolveImage(Options{Image: c.optImage})
+			if img != c.want || src != c.wantSource {
+				t.Fatalf("resolveImage = (%q, %q), want (%q, %q)", img, src, c.want, c.wantSource)
+			}
+		})
+	}
+}
+
+// A non-default image must be visible in test output, not silent.
+func TestNonDefaultImageIsLogged(t *testing.T) {
+	t.Setenv(DSNEnv, "clickhouse://default@example.invalid:9000/default")
+
+	var logged []string
+	opts := Options{
+		Image: "clickhouse/clickhouse-server:26.2",
+		Logf:  func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) },
+	}
+	if _, _, err := StartContainer(opts); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(logged, "\n")
+	if !strings.Contains(joined, "26.2") || !strings.Contains(joined, "Options.Image") {
+		t.Fatalf("the override and its source must be logged, got:\n%s", joined)
+	}
+
+	// The default must not be announced — that would be noise on every run.
+	logged = nil
+	if _, _, err := StartContainer(Options{Logf: opts.Logf}); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range logged {
+		if strings.Contains(l, "using image") {
+			t.Fatalf("the default image should not be announced, got: %s", l)
+		}
+	}
+}
+
+// Start defaults Logf to the test log, so an override surfaces without the
+// caller wiring anything up.
+func TestStartWithDefaultsLogfToTestLog(t *testing.T) {
+	t.Setenv(DSNEnv, "clickhouse://default@example.invalid:9000/default")
+	t.Setenv(ImageEnv, "clickhouse/clickhouse-server:26.2")
+	// Fatals on error; the assertion is that it does not panic on a nil Logf.
+	if dsn := StartWith(t, Options{}); dsn == "" {
+		t.Fatal("expected the env DSN back")
 	}
 }
 
@@ -132,5 +198,61 @@ func TestStartRealContainer(t *testing.T) {
 	}
 	if name != "scratch" {
 		t.Fatalf("currentDatabase() = %q, want scratch", name)
+	}
+}
+
+// The acceptance test for the override: a consumer pinning a specific version
+// must actually get that server, not the shared default. This is the case that
+// blocked adoption — a repo tracking a managed 26.2 service cannot generate its
+// schema artifact on 24.8 without risking systematic false drift.
+func TestStartWithImageOverrideRunsThatVersion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skipping container start")
+	}
+	t.Setenv(DSNEnv, "") // exercise the container path, not an ambient server
+
+	const want = "26.2"
+	dsn := StartWith(t, Options{Image: "clickhouse/clickhouse-server:" + want})
+
+	db, err := sql.Open("clickhouse", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version string
+	if err := db.QueryRow("SELECT version()").Scan(&version); err != nil {
+		t.Fatalf("query the overridden server: %v", err)
+	}
+	if !strings.HasPrefix(version, want) {
+		t.Fatalf("server reports %q, want the overridden %s.x — the override did not take effect", version, want)
+	}
+	// And it is genuinely different from the shared default.
+	if strings.HasPrefix(version, strings.TrimPrefix(Image, "clickhouse/clickhouse-server:")) {
+		t.Fatalf("got the default image version %q despite the override", version)
+	}
+}
+
+// The env override must reach the container too, so a CI matrix can vary the
+// version without code changes.
+func TestEnvImageOverrideRunsThatVersion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short: skipping container start")
+	}
+	t.Setenv(DSNEnv, "")
+	t.Setenv(ImageEnv, "clickhouse/clickhouse-server:26.2")
+
+	db, err := sql.Open("clickhouse", Start(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var version string
+	if err := db.QueryRow("SELECT version()").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(version, "26.2") {
+		t.Fatalf("server reports %q, want 26.2.x from %s", version, ImageEnv)
 	}
 }
