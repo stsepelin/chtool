@@ -37,7 +37,10 @@ type Conn = driver.Conn
 //     only on structs used for reads.
 //
 // An exported field with no `ch` tag is not written, even where clickhouse-go
-// would match it against a column by Go field name.
+// would match it against a column by Go field name. If such a field would take
+// over a column a tag already named — the driver indexes untagged fields under
+// their Go name, and the last field claiming a name wins — that is an error
+// too, rather than a column filled from a field the tags say is unused.
 func Insert[T any](ctx context.Context, conn Conn, table string, rows []T) error {
 	if len(rows) == 0 {
 		return nil
@@ -179,6 +182,9 @@ func columnsFor(t reflect.Type) ([]Column, error) {
 	if err == nil {
 		err = checkDuplicates(cols)
 	}
+	if err == nil {
+		err = checkShadowing(t, cols)
+	}
 	if err != nil {
 		cols = nil
 	}
@@ -292,6 +298,56 @@ func checkName(tag string) error {
 		return fmt.Errorf(`ch:%q contains a backslash, which ClickHouse treats as an escape inside a quoted identifier`, tag)
 	}
 	return nil
+}
+
+// checkShadowing confirms every column will be filled from the field that named
+// it. clickhouse-go indexes untagged exported fields under their Go name as
+// well, and a later entry overwrites an earlier one, so an untagged field named
+// X shadows a `ch:"X"` above it: the tagged value is dropped and the untagged
+// one written in its place, with nothing in the statement to show for it.
+func checkShadowing(t reflect.Type, cols []Column) error {
+	idx := map[string]string{}
+	driverIndex(t, nil, map[reflect.Type]bool{}, idx)
+	for _, c := range cols {
+		if got := idx[c.Name]; got != c.Field {
+			return fmt.Errorf(
+				"column %q would be written from field %s rather than %s: clickhouse-go indexes untagged fields by their Go name too, and the last field claiming a name wins",
+				c.Name, got, c.Field)
+		}
+	}
+	return nil
+}
+
+// driverIndex reproduces clickhouse-go's own field index — every exported field
+// under its `ch` tag or, untagged, its Go name, embedded structs flattened,
+// later entries overwriting earlier ones — so that checkShadowing compares
+// against what the driver will actually do rather than what the tags suggest.
+func driverIndex(t reflect.Type, prefix []string, path map[reflect.Type]bool, out map[string]string) {
+	if t.Kind() != reflect.Struct || path[t] {
+		return
+	}
+	path[t] = true
+	defer delete(path, t)
+
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name := f.Name
+		if tag := f.Tag.Get("ch"); tag != "" {
+			name = tag
+		}
+		if name == "-" || (f.PkgPath != "" && !f.Anonymous) {
+			continue
+		}
+		fieldPath := append(slices.Clip(prefix), f.Name)
+		if f.Anonymous {
+			// An embedded pointer contributes nothing; the driver never follows one.
+			if f.Type.Kind() != reflect.Pointer {
+				driverIndex(f.Type, fieldPath, path, out)
+			}
+			continue
+		}
+		out[name] = strings.Join(fieldPath, ".")
+	}
 }
 
 func checkDuplicates(cols []Column) error {

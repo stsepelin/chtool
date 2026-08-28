@@ -335,3 +335,59 @@ func TestInsertDetectsAnUnrecognisedColumnList(t *testing.T) {
 		t.Error("the batch must be aborted, or it holds its connection")
 	}
 }
+
+// TestInsertRejectsShadowedColumns covers a value that the tags say is written
+// and the driver writes from somewhere else. clickhouse-go indexes untagged
+// exported fields under their Go name, last one winning, so an untagged X takes
+// over the column a `ch:"X"` above it named — verified against a real server:
+// the tagged 137 is discarded and the untagged 999 stored in its place.
+func TestInsertRejectsShadowedColumns(t *testing.T) {
+	type shadowed struct {
+		Tagged int64 `ch:"X"`
+		X      int64
+	}
+	err := insertOf[shadowed]()
+	if err == nil {
+		t.Fatal("a column filled from a field other than the one that named it must be refused")
+	}
+	for _, want := range []string{"X", "Tagged", "last field claiming a name wins"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+// The same two fields the other way round are fine: the tag is last, so the
+// driver resolves the column to the tagged field, which is what was asked for.
+func TestInsertAllowsTagWinningOverUntaggedField(t *testing.T) {
+	type ordered struct {
+		X      int64
+		Tagged int64 `ch:"X"`
+	}
+	if err := insertOf[ordered](); err != nil {
+		t.Errorf("the tagged field wins here, so this must be accepted: %v", err)
+	}
+}
+
+// A promoted field from an embedded struct shadows just the same. The names
+// have to collide exactly — `ch:"shop"` and a Go field Shop are two different
+// keys to the driver — so this pairs a tag with a field of that very name.
+func TestInsertRejectsShadowingFromEmbeddedStruct(t *testing.T) {
+	type labelled struct {
+		Label int64 `ch:"Note"`
+	}
+	type promoted struct {
+		Note int64
+	}
+	type outer struct {
+		labelled
+		promoted
+	}
+	err := insertOf[outer]()
+	if err == nil {
+		t.Fatal("a promoted untagged field that takes over a tagged column must be refused")
+	}
+	if !strings.Contains(err.Error(), "promoted.Note") {
+		t.Errorf("error should name the shadowing field, got: %v", err)
+	}
+}

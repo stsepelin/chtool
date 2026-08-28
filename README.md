@@ -320,6 +320,7 @@ discarding it is the failure this behaviour exists to prevent.
 | `ch:` tag on a `MATERIALIZED`/`ALIAS` column | Error — the server computes those and refuses writes |
 | `ch:` tag on an `EPHEMERAL` column | Written — naming it is how a `DEFAULT` that reads it gets a value |
 | Exported field with no `ch` tag | Not written |
+| Untagged field whose Go name equals a tagged column | Error — the driver would fill the column from it instead |
 | Fields of an embedded struct | Written, spliced in at the embedded field's position |
 | `ch:` tag on the embedded field itself | Error — clickhouse-go flattens the struct and ignores it; tag the inner fields |
 

@@ -503,3 +503,41 @@ func TestIntegrationUnreadableColumnListIsReported(t *testing.T) {
 		t.Errorf("error should explain that the list did not take effect, got: %v", err)
 	}
 }
+
+// TestIntegrationShadowedColumnIsRefused pins the collision against a real
+// server. clickhouse-go indexes untagged exported fields under their Go name,
+// last one winning, so the untagged X below takes over the column `ch:"X"`
+// named: without the guard this stores 999 and drops the 137 the tag asked
+// for, which is a value going missing with nothing to show for it.
+func TestIntegrationShadowedColumnIsRefused(t *testing.T) {
+	const db = "chtool_it_structs_shadow"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := conn.Exec(ctx,
+		"CREATE TABLE "+db+".t (`X` Int64) ENGINE = MergeTree ORDER BY tuple()",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	type shadowed struct {
+		Tagged int64 `ch:"X"`
+		X      int64
+	}
+	if err := Insert(ctx, conn, db+".t", []shadowed{{Tagged: 137, X: 999}}); err == nil {
+		var got int64
+		if scanErr := conn.QueryRow(ctx, "SELECT X FROM "+db+".t").Scan(&got); scanErr == nil {
+			t.Fatalf("insert should have been refused; column X holds %d", got)
+		}
+		t.Fatal("insert should have been refused")
+	}
+
+	var n uint64
+	if err := conn.QueryRow(ctx, "SELECT count() FROM "+db+".t").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("refused insert wrote %d rows, want 0", n)
+	}
+}
