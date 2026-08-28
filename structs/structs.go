@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
@@ -51,6 +50,10 @@ func Insert[T any](ctx context.Context, conn Conn, table string, rows []T) error
 	if err != nil {
 		return fmt.Errorf("prepare batch %s: %w", table, err)
 	}
+	if err := verifyBatchColumns(batch, cols); err != nil {
+		_ = batch.Abort()
+		return fmt.Errorf("prepare batch %s: %w", table, err)
+	}
 	for i := range rows {
 		if err := batch.AppendStruct(&rows[i]); err != nil {
 			_ = batch.Abort()
@@ -87,6 +90,40 @@ func insertQuery(table string, cols []Column) string {
 	}
 	b.WriteByte(')')
 	return b.String()
+}
+
+// verifyBatchColumns checks that the driver ended up with the columns the
+// statement named. It re-reads the list out of the query text with a regex
+// rather than tracking the quoting, and a list it cannot read is not an error
+// to it — it falls back to every column of the table, which is the behaviour
+// this package moved away from.
+//
+// That fallback does not corrupt anything: AppendStruct still matches columns
+// by name, so the batch either writes what it would have anyway or fails on a
+// column the struct lacks. What it does do is quietly withdraw the guarantee
+// Insert documents, turning an added column back into "missing destination
+// name <some unrelated column>". Comparing against the driver's own answer
+// makes that a statement about the actual column list instead, and needs no
+// model of the parser here to stay in step with the dependency.
+func verifyBatchColumns(batch driver.Batch, cols []Column) error {
+	got := batch.Columns()
+	mismatch := len(got) != len(cols)
+	for i := 0; !mismatch && i < len(got); i++ {
+		mismatch = got[i].Name() != cols[i].Name
+	}
+	if !mismatch {
+		return nil
+	}
+	names := make([]string, len(got))
+	for i, c := range got {
+		names[i] = c.Name()
+	}
+	want := make([]string, len(cols))
+	for i, c := range cols {
+		want[i] = c.Name
+	}
+	return fmt.Errorf("named columns [%s] but the driver resolved [%s]; a column name here is one clickhouse-go cannot read back out of the statement, so it fell back to the whole table",
+		strings.Join(want, ", "), strings.Join(names, ", "))
 }
 
 type Column struct {
@@ -232,34 +269,27 @@ func resolveColumns(t reflect.Type, prefix []string, path map[reflect.Type]bool)
 	return cols, nil
 }
 
-// checkName rejects tags that would not survive clickhouse-go's own parsing of
-// the statement. The driver re-reads the column list out of the query text with
-// a regex rather than tracking the quoting, and a list it fails to read is not
-// an error: it falls back to every column of the table, which is exactly the
-// behaviour this package replaced. So the unparseable forms have to be refused
-// here, where the failure can at least be loud.
-//
-// Only the forms that genuinely break it are refused. A name containing a
-// double quote or a dash round-trips fine and is left alone.
+// checkName rejects tags that would not survive the trip through clickhouse-go
+// and ClickHouse as the name they were written as. These three corrupt the name
+// itself; anything else that goes wrong with a column list is caught after the
+// fact by verifyBatchColumns, which compares against the driver's own answer
+// rather than guessing at its parser.
 func checkName(tag string) error {
 	switch {
-	case strings.ContainsAny(tag, ",`()"):
-		// A comma splits the list, a backtick is stripped wherever it appears,
-		// and a parenthesis unbalances the group the driver matches the list
-		// with — after which it reads the statement as having no list at all.
-		return fmt.Errorf("ch:%q contains one of , ` ( ) — clickhouse-go cannot parse a column list containing those, and silently falls back to writing every column", tag)
+	case strings.Contains(tag, ","):
+		// The driver splits the list it re-reads on commas, so a name
+		// containing one arrives as two.
+		return fmt.Errorf("ch:%q contains a comma; clickhouse-go uses the whole tag as the column name and splits the column list on commas", tag)
+	case strings.Contains(tag, "`"):
+		// It strips every backtick from the list, not just the quoting pair.
+		return fmt.Errorf("ch:%q contains a backtick, which clickhouse-go strips wherever it appears in a column list", tag)
 	case strings.Contains(tag, `\`):
 		// ClickHouse reads a backslash inside backticks as an escape, so the
 		// server resolves a different name (or, for a trailing one, an
 		// unterminated identifier). Escaping it here would not help: the driver
 		// strips only backticks when it re-reads the list, so its idea of the
-		// column name would then differ from the server's and the block would
-		// fail to sort.
+		// column name would then differ from the server's.
 		return fmt.Errorf(`ch:%q contains a backslash, which ClickHouse treats as an escape inside a quoted identifier`, tag)
-	case strings.ContainsFunc(tag, unicode.IsSpace):
-		// FORMAT and VALUES clauses are stripped from the query text before the
-		// list is matched, so whitespace inside a name can truncate it.
-		return fmt.Errorf("ch:%q contains whitespace — clickhouse-go strips FORMAT/VALUES clauses from the query text before reading the column list, so a name containing whitespace can truncate it", tag)
 	}
 	return nil
 }

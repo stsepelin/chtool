@@ -3,7 +3,9 @@ package structs
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
@@ -30,7 +32,29 @@ func (c *fakeConn) PrepareBatch(_ context.Context, query string, _ ...driver.Pre
 	if c.batch == nil {
 		c.batch = &fakeBatch{}
 	}
+	// Stand in for the driver's own answer: unless a test is simulating a
+	// statement it could not read back, it resolves what the query named.
+	if c.batch.resolved == nil {
+		c.batch.resolved = columnsFromQuery(query)
+	}
 	return c.batch, nil
+}
+
+// columnsFromQuery reads the names back out of "INSERT INTO t (`a`, `b`)".
+func columnsFromQuery(query string) []string {
+	i := strings.Index(query, " (")
+	if i < 0 || !strings.HasSuffix(query, ")") {
+		return nil
+	}
+	inner := query[i+2 : len(query)-1]
+	if inner == "" {
+		return nil
+	}
+	names := strings.Split(inner, ", ")
+	for i, n := range names {
+		names[i] = strings.Trim(n, "`")
+	}
+	return names
 }
 
 func (c *fakeConn) Query(_ context.Context, _ string, _ ...any) (driver.Rows, error) {
@@ -46,6 +70,23 @@ type fakeBatch struct {
 	sent      bool
 	aborted   bool
 	appendErr error
+
+	// resolved is what the driver claims the batch's columns are. Left nil it
+	// mirrors the query; set explicitly it simulates a column list clickhouse-go
+	// could not read, where it silently falls back to the whole table.
+	resolved []string
+}
+
+func (b *fakeBatch) Columns() []column.Interface {
+	out := make([]column.Interface, 0, len(b.resolved))
+	for _, n := range b.resolved {
+		c, err := column.Type("Int64").Column(n, &column.ServerContext{})
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 func (b *fakeBatch) AppendStruct(any) error {

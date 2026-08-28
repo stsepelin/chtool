@@ -91,14 +91,8 @@ func TestInsertRejectsBadTags(t *testing.T) {
 		// A backtick cannot appear in a backtick-quoted tag, hence the plain literal.
 		ID int64 "ch:\"i`d\""
 	}
-	type parenTag struct {
-		ID int64 `ch:"metric("`
-	}
 	type backslashTag struct {
 		ID int64 `ch:"a\\b"`
-	}
-	type spaceTag struct {
-		ID int64 `ch:" id "`
 	}
 	type unexportedTagged struct {
 		id int64 `ch:"id"` //nolint:unused // the tag is the point
@@ -126,11 +120,9 @@ func TestInsertRejectsBadTags(t *testing.T) {
 		call func() error
 		want string
 	}{
-		{"comma in tag", insertOf[commaTag], "cannot parse"},
-		{"backtick in tag", insertOf[backtickTag], "cannot parse"},
-		{"parenthesis in tag", insertOf[parenTag], "cannot parse"},
+		{"comma in tag", insertOf[commaTag], "splits the column list"},
+		{"backtick in tag", insertOf[backtickTag], "strips"},
 		{"backslash in tag", insertOf[backslashTag], "escape"},
-		{"whitespace in tag", insertOf[spaceTag], "whitespace"},
 		{"tagged unexported field", insertOf[unexportedTagged], "unexported"},
 		{"embedded pointer struct", insertOf[embeddedPointer], "embed it by value"},
 		{"embedded non-struct", insertOf[embeddedScalar], "not a struct"},
@@ -197,12 +189,14 @@ func TestInsertAcceptsAwkwardButParseableNames(t *testing.T) {
 		Quoted string `ch:"my\"col"`
 		Dashed string `ch:"my-col"`
 		Dotted string `ch:"col.nested"`
+		Spaced string `ch:"my col"`
+		Parens string `ch:"metric(x)"`
 	}
 	conn := &fakeConn{}
 	if err := Insert(context.Background(), conn, "t", []awkward{{}}); err != nil {
 		t.Fatalf("these names round-trip through the driver and must be accepted: %v", err)
 	}
-	const want = "INSERT INTO t (`my\"col`, `my-col`, `col.nested`)"
+	const want = "INSERT INTO t (`my\"col`, `my-col`, `col.nested`, `my col`, `metric(x)`)"
 	if conn.query != want {
 		t.Errorf("query = %s, want %s", conn.query, want)
 	}
@@ -300,7 +294,7 @@ func TestInsertReportsBadTagsUnderEmbeddedPointer(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the malformed inner tag to be reported")
 	}
-	if !strings.Contains(err.Error(), "cannot parse") {
+	if !strings.Contains(err.Error(), "splits the column list") {
 		t.Errorf("error should name the parse problem, got: %v", err)
 	}
 }
@@ -314,5 +308,30 @@ func TestInsertAllowsEmbeddedPointerToNonStruct(t *testing.T) {
 	}
 	if err := insertOf[withPtr](); err != nil {
 		t.Errorf("nothing can be tagged under *int64, so it must be accepted: %v", err)
+	}
+}
+
+// TestInsertDetectsAnUnrecognisedColumnList covers the case the character
+// checks deliberately no longer try to predict: whatever the name, if the
+// driver did not end up with the columns the statement named, the promise that
+// an unlisted column takes its DEFAULT no longer holds, and saying so beats
+// failing later on an unrelated column.
+func TestInsertDetectsAnUnrecognisedColumnList(t *testing.T) {
+	conn := &fakeConn{batch: &fakeBatch{
+		// What the driver reports having resolved when it could not read the
+		// list: every column of the table, not the five the statement named.
+		resolved: []string{"id", "name", "money", "tags", "created_at", "creative_type"},
+	}}
+	err := Insert(context.Background(), conn, "events", []row{{ID: 1}})
+	if err == nil {
+		t.Fatal("a column list the driver did not act on must be reported")
+	}
+	for _, want := range []string{"creative_type", "whole table"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+	if !conn.batch.aborted {
+		t.Error("the batch must be aborted, or it holds its connection")
 	}
 }

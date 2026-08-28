@@ -434,3 +434,72 @@ func TestIntegrationInsertWritesEphemeralColumns(t *testing.T) {
 		t.Errorf("derived = %d, want 274; the ephemeral value never reached the DEFAULT", derived)
 	}
 }
+
+// TestIntegrationAwkwardColumnNamesRoundTrip pins the names that look alarming
+// but are ordinary ClickHouse identifiers. clickhouse-go carries its own
+// regression test for the parenthesised form, so refusing them here would break
+// schemas that work.
+func TestIntegrationAwkwardColumnNamesRoundTrip(t *testing.T) {
+	const db = "chtool_it_structs_names"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".t ("+
+		"`metric(x)` Int64, `my col` Int64, `my-col` Int64, `extra` Int64 DEFAULT 137"+
+		") ENGINE = MergeTree ORDER BY tuple()"); err != nil {
+		t.Fatal(err)
+	}
+
+	type awkward struct {
+		Parens int64 `ch:"metric(x)"`
+		Spaced int64 `ch:"my col"`
+		Dashed int64 `ch:"my-col"`
+	}
+	if err := Insert(ctx, conn, db+".t", []awkward{{Parens: 41, Spaced: 42, Dashed: 43}}); err != nil {
+		t.Fatalf("these are valid identifiers and must be insertable: %v", err)
+	}
+
+	var got awkward
+	var extra int64
+	if err := conn.QueryRow(ctx, "SELECT `metric(x)`, `my col`, `my-col`, extra FROM "+db+".t").
+		Scan(&got.Parens, &got.Spaced, &got.Dashed, &extra); err != nil {
+		t.Fatal(err)
+	}
+	if want := (awkward{41, 42, 43}); got != want {
+		t.Errorf("round-trip = %+v, want %+v", got, want)
+	}
+	// The untagged column still takes its DEFAULT, so the list was honoured.
+	if extra != 137 {
+		t.Errorf("extra = %d, want the DEFAULT 137", extra)
+	}
+}
+
+// TestIntegrationUnreadableColumnListIsReported uses a name clickhouse-go
+// genuinely cannot read back — an unbalanced parenthesis — against a table with
+// a column the struct does not tag. The driver quietly discards the list and
+// resolves the whole table, which withdraws the DEFAULT guarantee; Insert has
+// to say so rather than fail later on a column nobody named.
+func TestIntegrationUnreadableColumnListIsReported(t *testing.T) {
+	const db = "chtool_it_structs_unreadable"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".t ("+
+		"`metric(` Int64, `extra` Int64 DEFAULT 137"+
+		") ENGINE = MergeTree ORDER BY tuple()"); err != nil {
+		t.Fatal(err)
+	}
+
+	type unbalanced struct {
+		Metric int64 `ch:"metric("`
+	}
+	err := Insert(ctx, conn, db+".t", []unbalanced{{Metric: 1}})
+	if err == nil {
+		t.Fatal("a column list the driver discarded must be reported, not assumed to have applied")
+	}
+	if !strings.Contains(err.Error(), "whole table") {
+		t.Errorf("error should explain that the list did not take effect, got: %v", err)
+	}
+}
