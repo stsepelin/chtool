@@ -330,8 +330,9 @@ per `Insert`, against a network round trip).
 
 #### Upgrading from v0.4.0
 
-`Insert` keeps its signature; what changes is that two situations it used to
-tolerate are now errors. Before bumping, check every struct you pass to it for:
+`Insert` keeps its signature; what changes is that situations it used to
+tolerate silently are now errors. Before bumping, check every struct you pass to
+it for:
 
 1. **`ch:` tags naming columns the table does not have.** These were silently
    discarded on every insert — that field never reached ClickHouse.
@@ -343,8 +344,10 @@ tolerate are now errors. Before bumping, check every struct you pass to it for:
 3. **Exported fields with no `ch` tag whose Go name matches a column.**
    clickhouse-go matches an untagged field by its Go field name, so the old bare
    insert wrote it; an explicit list does not, and ClickHouse stores that
-   column's `DEFAULT` instead. Tag them. A struct carrying no `ch` tags at all
-   now returns an error rather than inserting by field name.
+   column's `DEFAULT` instead. Tag them. Where such a field collides with a name
+   a tag already claims, `Insert` refuses rather than filling the column from
+   it. A struct carrying no `ch` tags at all now returns an error rather than
+   inserting by field name.
 
 ---
 
