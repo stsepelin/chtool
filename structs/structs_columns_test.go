@@ -3,6 +3,7 @@ package structs
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -90,8 +91,8 @@ func TestInsertRejectsBadTags(t *testing.T) {
 		// A backtick cannot appear in a backtick-quoted tag, hence the plain literal.
 		ID int64 "ch:\"i`d\""
 	}
-	type quoteTag struct {
-		ID int64 `ch:"\"id\""`
+	type parenTag struct {
+		ID int64 `ch:"metric("`
 	}
 	type spaceTag struct {
 		ID int64 `ch:" id "`
@@ -124,8 +125,8 @@ func TestInsertRejectsBadTags(t *testing.T) {
 	}{
 		{"comma in tag", insertOf[commaTag], "cannot parse"},
 		{"backtick in tag", insertOf[backtickTag], "cannot parse"},
-		{"double quote in tag", insertOf[quoteTag], "cannot parse"},
-		{"padded tag", insertOf[spaceTag], "whitespace"},
+		{"parenthesis in tag", insertOf[parenTag], "cannot parse"},
+		{"whitespace in tag", insertOf[spaceTag], "whitespace"},
 		{"tagged unexported field", insertOf[unexportedTagged], "unexported"},
 		{"embedded pointer struct", insertOf[embeddedPointer], "embed it by value"},
 		{"embedded non-struct", insertOf[embeddedScalar], "not a struct"},
@@ -178,8 +179,72 @@ func BenchmarkInsertColumns(b *testing.B) {
 func BenchmarkResolveColumnsUncached(b *testing.B) {
 	t := rowType[row]()
 	for b.Loop() {
-		if _, err := resolveColumns(t, nil); err != nil {
+		if _, err := resolveColumns(t, nil, map[reflect.Type]bool{}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestInsertAcceptsAwkwardButParseableNames guards against over-tightening
+// checkName. These names look alarming but survive clickhouse-go's parsing
+// intact, so rejecting them would break schemas that work today.
+func TestInsertAcceptsAwkwardButParseableNames(t *testing.T) {
+	type awkward struct {
+		Quoted string `ch:"my\"col"`
+		Dashed string `ch:"my-col"`
+		Dotted string `ch:"col.nested"`
+	}
+	conn := &fakeConn{}
+	if err := Insert(context.Background(), conn, "t", []awkward{{}}); err != nil {
+		t.Fatalf("these names round-trip through the driver and must be accepted: %v", err)
+	}
+	const want = "INSERT INTO t (`my\"col`, `my-col`, `col.nested`)"
+	if conn.query != want {
+		t.Errorf("query = %s, want %s", conn.query, want)
+	}
+}
+
+// node is legal Go — a linked-list node embeds a pointer to itself. Resolving
+// it must terminate: clickhouse-go never follows an embedded pointer, so the
+// cycle contributes nothing.
+type node struct {
+	*node       //nolint:unused // the self-reference is the case under test
+	ID    int64 `ch:"id"`
+}
+
+func TestColumnsTerminatesOnSelfEmbeddedPointer(t *testing.T) {
+	var names []string
+	for _, c := range Columns[node]() {
+		names = append(names, c.Name)
+	}
+	if got := strings.Join(names, ","); got != "id" {
+		t.Fatalf("Columns = %q, want just the tagged field", got)
+	}
+	if err := Insert(context.Background(), &fakeConn{}, "t", []node{{ID: 1}}); err != nil {
+		t.Errorf("Insert: %v", err)
+	}
+}
+
+type mutualA struct {
+	*mutualB
+	A int64 `ch:"a"`
+}
+
+type mutualB struct {
+	*mutualA
+	B int64 `ch:"b"`
+}
+
+// Mutual embedding must terminate too. Here it terminates in an error rather
+// than a column list, because mutualB really does carry a tagged field that
+// clickhouse-go would never write through an embedded pointer — the same
+// refusal as any other embedded pointer, just reached through a cycle.
+func TestColumnsTerminatesOnMutualEmbedding(t *testing.T) {
+	err := Insert(context.Background(), &fakeConn{}, "t", []mutualA{{A: 1}})
+	if err == nil {
+		t.Fatal("a tagged field under an embedded pointer must be refused")
+	}
+	if !strings.Contains(err.Error(), "embed it by value") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }

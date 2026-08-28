@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
@@ -134,7 +135,7 @@ func columnsFor(t reflect.Type) ([]Column, error) {
 		res := r.(resolution)
 		return res.cols, res.err
 	}
-	cols, err := resolveColumns(t, nil)
+	cols, err := resolveColumns(t, nil, map[reflect.Type]bool{})
 	if err == nil && len(cols) == 0 {
 		err = fmt.Errorf("no ch:-tagged fields on %s", t)
 	}
@@ -152,10 +153,19 @@ func columnsFor(t reflect.Type) ([]Column, error) {
 // that the column list names exactly the fields the driver will look for. Where
 // the driver would quietly contribute nothing for a field, this returns an
 // error instead: a value that cannot reach the table must be loud.
-func resolveColumns(t reflect.Type, prefix []string) ([]Column, error) {
+func resolveColumns(t reflect.Type, prefix []string, path map[reflect.Type]bool) ([]Column, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%s is not a struct", t)
 	}
+	if path[t] {
+		// Pointer embedding can be cyclic and still be legal Go — a linked-list
+		// node embeds *Node. clickhouse-go never follows an embedded pointer, so
+		// a type already on the path contributes nothing more.
+		return nil, nil
+	}
+	path[t] = true
+	defer delete(path, t)
+
 	var cols []Column
 	for i := range t.NumField() {
 		f := t.Field(i)
@@ -163,7 +173,7 @@ func resolveColumns(t reflect.Type, prefix []string) ([]Column, error) {
 		if tag == "-" {
 			continue
 		}
-		path := append(slices.Clip(prefix), f.Name)
+		fieldPath := append(slices.Clip(prefix), f.Name)
 
 		if f.Anonymous {
 			// The driver flattens an embedded struct and ignores any tag on the
@@ -172,18 +182,18 @@ func resolveColumns(t reflect.Type, prefix []string) ([]Column, error) {
 			if et.Kind() == reflect.Pointer {
 				// The driver drops an embedded pointer struct entirely, tags and
 				// all, so anything tagged under one would never be written.
-				inner, err := resolveColumns(et.Elem(), path)
+				inner, err := resolveColumns(et.Elem(), fieldPath, path)
 				if err == nil && len(inner) > 0 {
 					return nil, fmt.Errorf(
 						"embedded pointer %s carries ch:-tagged fields (%s), which clickhouse-go never writes; embed it by value",
-						strings.Join(path, "."), inner[0].Name)
+						strings.Join(fieldPath, "."), inner[0].Name)
 				}
 				continue
 			}
 			if et.Kind() != reflect.Struct {
-				return nil, fmt.Errorf("embedded %s is %s, not a struct; clickhouse-go panics on it", strings.Join(path, "."), et.Kind())
+				return nil, fmt.Errorf("embedded %s is %s, not a struct; clickhouse-go panics on it", strings.Join(fieldPath, "."), et.Kind())
 			}
-			inner, err := resolveColumns(et, path)
+			inner, err := resolveColumns(et, fieldPath, path)
 			if err != nil {
 				return nil, err
 			}
@@ -195,29 +205,39 @@ func resolveColumns(t reflect.Type, prefix []string) ([]Column, error) {
 			continue
 		}
 		if f.PkgPath != "" {
-			return nil, fmt.Errorf("field %s is unexported but tagged ch:%q; clickhouse-go skips it, so it would never be written", strings.Join(path, "."), tag)
+			return nil, fmt.Errorf("field %s is unexported but tagged ch:%q; clickhouse-go skips it, so it would never be written", strings.Join(fieldPath, "."), tag)
 		}
 		if err := checkName(tag); err != nil {
-			return nil, fmt.Errorf("field %s: %w", strings.Join(path, "."), err)
+			return nil, fmt.Errorf("field %s: %w", strings.Join(fieldPath, "."), err)
 		}
 		cols = append(cols, Column{
-			Field: strings.Join(path, "."), Name: tag, GoType: f.Type.String(),
+			Field: strings.Join(fieldPath, "."), Name: tag, GoType: f.Type.String(),
 			typ: f.Type, chType: f.Tag.Get("chtype"),
 		})
 	}
 	return cols, nil
 }
 
-// checkName rejects tags the driver or the generated SQL cannot round-trip.
-// clickhouse-go treats the whole `ch` tag as the column name — it has no tag
-// options — so a comma is a typo rather than a modifier, and it would also
-// split the generated column list in the wrong place.
+// checkName rejects tags that would not survive clickhouse-go's own parsing of
+// the statement. The driver re-reads the column list out of the query text with
+// a regex rather than tracking the quoting, and a list it fails to read is not
+// an error: it falls back to every column of the table, which is exactly the
+// behaviour this package replaced. So the unparseable forms have to be refused
+// here, where the failure can at least be loud.
+//
+// Only the forms that genuinely break it are refused. A name containing a
+// double quote or a dash round-trips fine and is left alone.
 func checkName(tag string) error {
 	switch {
-	case strings.TrimSpace(tag) != tag:
-		return fmt.Errorf("ch:%q has leading or trailing whitespace, which clickhouse-go trims away", tag)
-	case strings.ContainsAny(tag, ",`\""):
-		return fmt.Errorf("ch:%q contains one of , ` \" — clickhouse-go uses the whole tag as the column name and cannot parse those", tag)
+	case strings.ContainsAny(tag, ",`()"):
+		// A comma splits the list, a backtick is stripped wherever it appears,
+		// and a parenthesis unbalances the group the driver matches the list
+		// with — after which it reads the statement as having no list at all.
+		return fmt.Errorf("ch:%q contains one of , ` ( ) — clickhouse-go cannot parse a column list containing those, and silently falls back to writing every column", tag)
+	case strings.ContainsFunc(tag, unicode.IsSpace):
+		// FORMAT and VALUES clauses are stripped from the query text before the
+		// list is matched, so whitespace inside a name can truncate it.
+		return fmt.Errorf("ch:%q contains whitespace — clickhouse-go strips FORMAT/VALUES clauses from the query text before reading the column list, so a name containing whitespace can truncate it", tag)
 	}
 	return nil
 }

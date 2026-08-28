@@ -400,3 +400,37 @@ func TestIntegrationInsertToleratesAddedColumnsOverHTTP(t *testing.T) {
 			"column list was not recognised and HTTP wrote every column", creative, "banner137")
 	}
 }
+
+// TestIntegrationInsertWritesEphemeralColumns pins the one non-stored column
+// kind that must be named. An EPHEMERAL column exists only to feed another
+// column's DEFAULT, so leaving it out of the statement leaves that DEFAULT
+// reading a zero — the bare insert could never supply it, because the server
+// omits ephemeral columns from the header block it answers with.
+func TestIntegrationInsertWritesEphemeralColumns(t *testing.T) {
+	const db = "chtool_it_structs_eph"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := conn.Exec(ctx, "CREATE TABLE "+db+".events ("+
+		"`id` Int64, `eph` Int64 EPHEMERAL, `derived` Int64 DEFAULT eph * 2"+
+		") ENGINE = MergeTree ORDER BY id"); err != nil {
+		t.Fatal(err)
+	}
+
+	type withEphemeral struct {
+		ID  int64 `ch:"id"`
+		Eph int64 `ch:"eph"`
+	}
+	if err := Insert(ctx, conn, db+".events", []withEphemeral{{ID: 1, Eph: 137}}); err != nil {
+		t.Fatalf("an EPHEMERAL column may be named in an insert: %v", err)
+	}
+
+	var derived int64
+	if err := conn.QueryRow(ctx, "SELECT derived FROM "+db+".events").Scan(&derived); err != nil {
+		t.Fatal(err)
+	}
+	if derived != 274 {
+		t.Errorf("derived = %d, want 274; the ephemeral value never reached the DEFAULT", derived)
+	}
+}

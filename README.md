@@ -318,6 +318,7 @@ discarding it is the failure this behaviour exists to prevent.
 | Column in the table, not tagged | Fine — the server applies its `DEFAULT`, or the type zero |
 | `ch:` tag with no such column | Error from the server (`No such column`) |
 | `ch:` tag on a `MATERIALIZED`/`ALIAS` column | Error — the server computes those and refuses writes |
+| `ch:` tag on an `EPHEMERAL` column | Written — naming it is how a `DEFAULT` that reads it gets a value |
 | Exported field with no `ch` tag | Not written |
 | Fields of an embedded struct | Written, spliced in at the embedded field's position |
 
@@ -333,9 +334,15 @@ tolerate are now errors. Before bumping, check every struct you pass to it for:
 1. **`ch:` tags naming columns the table does not have.** These were silently
    discarded on every insert — that field never reached ClickHouse.
    `VerifyTags` already reports them as *"in struct but missing from table"*.
-2. **Tags naming `MATERIALIZED`, `ALIAS`, or `EPHEMERAL` columns.** These were
-   ignored before and now fail. Reads use the same `ch` tag, so a struct shared
-   between reads and writes is the case to look at.
+2. **Tags naming `MATERIALIZED` or `ALIAS` columns.** These were ignored before
+   and now fail, because the server computes them and refuses writes. Reads use
+   the same `ch` tag, so a struct shared between reads and writes is the case to
+   look at.
+3. **Exported fields with no `ch` tag whose Go name matches a column.**
+   clickhouse-go matches an untagged field by its Go field name, so the old bare
+   insert wrote it; an explicit list does not, and ClickHouse stores that
+   column's `DEFAULT` instead. Tag them. A struct carrying no `ch` tags at all
+   now returns an error rather than inserting by field name.
 
 ---
 
