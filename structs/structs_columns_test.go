@@ -94,6 +94,9 @@ func TestInsertRejectsBadTags(t *testing.T) {
 	type parenTag struct {
 		ID int64 `ch:"metric("`
 	}
+	type backslashTag struct {
+		ID int64 `ch:"a\\b"`
+	}
 	type spaceTag struct {
 		ID int64 `ch:" id "`
 	}
@@ -126,6 +129,7 @@ func TestInsertRejectsBadTags(t *testing.T) {
 		{"comma in tag", insertOf[commaTag], "cannot parse"},
 		{"backtick in tag", insertOf[backtickTag], "cannot parse"},
 		{"parenthesis in tag", insertOf[parenTag], "cannot parse"},
+		{"backslash in tag", insertOf[backslashTag], "escape"},
 		{"whitespace in tag", insertOf[spaceTag], "whitespace"},
 		{"tagged unexported field", insertOf[unexportedTagged], "unexported"},
 		{"embedded pointer struct", insertOf[embeddedPointer], "embed it by value"},

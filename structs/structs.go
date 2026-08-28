@@ -234,6 +234,14 @@ func checkName(tag string) error {
 		// and a parenthesis unbalances the group the driver matches the list
 		// with — after which it reads the statement as having no list at all.
 		return fmt.Errorf("ch:%q contains one of , ` ( ) — clickhouse-go cannot parse a column list containing those, and silently falls back to writing every column", tag)
+	case strings.Contains(tag, `\`):
+		// ClickHouse reads a backslash inside backticks as an escape, so the
+		// server resolves a different name (or, for a trailing one, an
+		// unterminated identifier). Escaping it here would not help: the driver
+		// strips only backticks when it re-reads the list, so its idea of the
+		// column name would then differ from the server's and the block would
+		// fail to sort.
+		return fmt.Errorf(`ch:%q contains a backslash, which ClickHouse treats as an escape inside a quoted identifier`, tag)
 	case strings.ContainsFunc(tag, unicode.IsSpace):
 		// FORMAT and VALUES clauses are stripped from the query text before the
 		// list is matched, so whitespace inside a name can truncate it.
