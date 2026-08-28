@@ -321,6 +321,7 @@ discarding it is the failure this behaviour exists to prevent.
 | `ch:` tag on an `EPHEMERAL` column | Written — naming it is how a `DEFAULT` that reads it gets a value |
 | Exported field with no `ch` tag | Not written |
 | Fields of an embedded struct | Written, spliced in at the embedded field's position |
+| `ch:` tag on the embedded field itself | Error — clickhouse-go flattens the struct and ignores it; tag the inner fields |
 
 Resolving a struct's columns is reflection over its tags only — no query, no
 extra round trip — and the result is cached per type (~60 ns and one allocation

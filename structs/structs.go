@@ -176,14 +176,28 @@ func resolveColumns(t reflect.Type, prefix []string, path map[reflect.Type]bool)
 		fieldPath := append(slices.Clip(prefix), f.Name)
 
 		if f.Anonymous {
-			// The driver flattens an embedded struct and ignores any tag on the
-			// embedded field itself.
+			// The driver flattens an embedded struct, ignoring any tag on the
+			// embedded field itself, so a tag here names a column that would
+			// never be written — the field is not one value to the driver, it
+			// is however many its type carries.
+			if tag != "" {
+				return nil, fmt.Errorf(
+					"embedded field %s is tagged ch:%q, but clickhouse-go flattens embedded structs and ignores that tag, so no such column would be written; tag the fields inside %s instead, or use ch:\"-\" to skip it",
+					strings.Join(fieldPath, "."), tag, f.Type)
+			}
 			et := f.Type
 			if et.Kind() == reflect.Pointer {
 				// The driver drops an embedded pointer struct entirely, tags and
 				// all, so anything tagged under one would never be written.
+				if et.Elem().Kind() != reflect.Struct {
+					// Nothing can be tagged under a non-struct, so nothing is lost.
+					continue
+				}
 				inner, err := resolveColumns(et.Elem(), fieldPath, path)
-				if err == nil && len(inner) > 0 {
+				if err != nil {
+					return nil, err
+				}
+				if len(inner) > 0 {
 					return nil, fmt.Errorf(
 						"embedded pointer %s carries ch:-tagged fields (%s), which clickhouse-go never writes; embed it by value",
 						strings.Join(fieldPath, "."), inner[0].Name)

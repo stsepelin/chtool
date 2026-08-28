@@ -252,3 +252,67 @@ func TestColumnsTerminatesOnMutualEmbedding(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// opaque has nothing tagged inside it, so a tag on the embedding field is the
+// only thing that could name a column — and clickhouse-go ignores it.
+type opaque struct{ A int }
+
+type malformedInner struct {
+	ID int64 `ch:"bad,name"`
+}
+
+func TestInsertRejectsTagOnEmbeddedField(t *testing.T) {
+	type taggedOpaque struct {
+		opaque `ch:"payload"`
+		ID     int64 `ch:"id"`
+	}
+	type taggedBase struct {
+		embeddedBase `ch:"payload"`
+		Name         string `ch:"name"`
+	}
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"embedded struct with nothing tagged inside", insertOf[taggedOpaque]},
+		{"embedded struct with tagged fields inside", insertOf[taggedBase]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if err == nil {
+				t.Fatal("a tag clickhouse-go ignores must not pass silently: no such column would be written")
+			}
+			if !strings.Contains(err.Error(), "flattens embedded structs") {
+				t.Errorf("error should explain why the tag has no effect, got: %v", err)
+			}
+		})
+	}
+}
+
+// A malformed tag beneath an embedded pointer must still surface. Reporting
+// nothing would leave every field under the pointer silently unwritten.
+func TestInsertReportsBadTagsUnderEmbeddedPointer(t *testing.T) {
+	type outer struct {
+		*malformedInner
+		ID int64 `ch:"id"`
+	}
+	err := insertOf[outer]()
+	if err == nil {
+		t.Fatal("expected the malformed inner tag to be reported")
+	}
+	if !strings.Contains(err.Error(), "cannot parse") {
+		t.Errorf("error should name the parse problem, got: %v", err)
+	}
+}
+
+// An embedded pointer to a non-struct has no tags beneath it, so nothing is
+// lost and it must not be rejected.
+func TestInsertAllowsEmbeddedPointerToNonStruct(t *testing.T) {
+	type withPtr struct {
+		*int64       //nolint:unused // an embedded pointer to a non-struct is the case
+		ID     int64 `ch:"id"`
+	}
+	if err := insertOf[withPtr](); err != nil {
+		t.Errorf("nothing can be tagged under *int64, so it must be accepted: %v", err)
+	}
+}
