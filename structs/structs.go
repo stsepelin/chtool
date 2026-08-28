@@ -76,17 +76,19 @@ func insertQuery(table string, cols []Column) string {
 	b.WriteString("INSERT INTO ")
 	b.WriteString(table)
 	// The space before "(" is load-bearing: clickhouse-go only recognises a
-	// column list preceded by whitespace, and a list it fails to recognise
-	// falls back to every column of the table on the HTTP protocol, which
-	// misaligns the batch rather than failing.
+	// column list preceded by whitespace, and one it does not recognise it
+	// discards, resolving the whole table instead. verifyBatchColumns catches
+	// that afterwards, but there is no reason to write a statement that trips
+	// it.
 	b.WriteString(" (")
 	for i, c := range cols {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		// Backticks, not double quotes: the driver strips the former from the
-		// parsed list correctly and mangles the latter on dotted identifiers.
-		// checkName has already rejected anything that would escape them.
+		// Backticks, not double quotes: the driver strips backticks from the
+		// list it re-reads, whereas it only trims double quotes at the ends,
+		// leaving the inner ones of a dotted name behind. checkName has already
+		// rejected the characters that would break out of them.
 		b.WriteByte('`')
 		b.WriteString(c.Name)
 		b.WriteByte('`')
