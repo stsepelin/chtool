@@ -273,6 +273,7 @@ type View struct {
 }
 
 // Batch insert (PrepareBatch → AppendStruct → Send); nil/empty is a no-op.
+// Sends: INSERT INTO analytics.views (`id`, `country`, `revenue`, `tags`, `created_at`)
 _ = structs.Insert(ctx, conn, "analytics.views", rows)
 
 // Drift-check the struct against the live table's columns.
@@ -289,10 +290,52 @@ a field whose type can't be inferred and has no `chtype` returns an error.
 
 | Function | Returns |
 |---|---|
-| `Insert[T](ctx, conn, table, rows)` | Batches `rows` into `table` (may be db-qualified) |
+| `Insert[T](ctx, conn, table, rows)` | Batches `rows` into `table` (may be db-qualified), naming its columns |
 | `VerifyTags[T](ctx, conn, db, table)` | `[]Diff` — struct-vs-table column-set mismatches (empty = agree) |
 | `CreateDDL[T](table, engine, orderBy)` | `CREATE TABLE` string |
 | `Columns[T]()` | The reflected `ch:`-tagged columns |
+
+### What an added column costs a consumer
+
+`Insert` names its columns explicitly, so a column the struct does not tag is
+simply left out of the statement and ClickHouse fills it with its `DEFAULT`.
+**Adding a column costs existing writers nothing — no redeploy, no error.** That
+sets the deploy order:
+
+| Change | Safe order |
+|---|---|
+| **Adding** a column | Migrate first. The struct can catch up whenever. |
+| **Dropping** a column | Ship the struct first, then migrate. |
+| **Renaming** a column | Both at once, or add-then-backfill-then-drop. |
+
+The two directions are deliberately not symmetric. An unknown column in the
+table is harmless because ClickHouse has a value for it; a `ch:` tag with no
+column is an error because the field's value has nowhere to go, and silently
+discarding it is the failure this behaviour exists to prevent.
+
+| Struct vs. table | Result |
+|---|---|
+| Column in the table, not tagged | Fine — the server applies its `DEFAULT`, or the type zero |
+| `ch:` tag with no such column | Error from the server (`No such column`) |
+| `ch:` tag on a `MATERIALIZED`/`ALIAS` column | Error — the server computes those and refuses writes |
+| Exported field with no `ch` tag | Not written |
+| Fields of an embedded struct | Written, spliced in at the embedded field's position |
+
+Resolving a struct's columns is reflection over its tags only — no query, no
+extra round trip — and the result is cached per type (~60 ns and one allocation
+per `Insert`, against a network round trip).
+
+#### Upgrading from v0.4.0
+
+`Insert` keeps its signature; what changes is that two situations it used to
+tolerate are now errors. Before bumping, check every struct you pass to it for:
+
+1. **`ch:` tags naming columns the table does not have.** These were silently
+   discarded on every insert — that field never reached ClickHouse.
+   `VerifyTags` already reports them as *"in struct but missing from table"*.
+2. **Tags naming `MATERIALIZED`, `ALIAS`, or `EPHEMERAL` columns.** These were
+   ignored before and now fail. Reads use the same `ch` tag, so a struct shared
+   between reads and writes is the case to look at.
 
 ---
 

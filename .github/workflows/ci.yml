@@ -136,6 +136,9 @@ jobs:
           --health-start-period 15s
     env:
       CHTOOL_TEST_DSN: clickhouse://localhost:9000/default
+      # The HTTP protocol resolves insert columns differently from native, so
+      # structs covers it too. Same server, the port the service already maps.
+      CHTOOL_TEST_DSN_HTTP: http://localhost:8123/default
       CHTOOL_REQUIRE_CH: 1 # fail (don't skip) if the service is unreachable
     steps:
       - uses: actions/checkout@v7

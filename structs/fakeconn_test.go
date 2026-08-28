@@ -15,9 +15,15 @@ type fakeConn struct {
 	prepareErr  error
 	liveColumns []string
 	queryErr    error
+
+	// query records what Insert asked for. The column list is the whole point
+	// of the statement now, so a fake that discards it can pass while the real
+	// insert names the wrong columns.
+	query string
 }
 
-func (c *fakeConn) PrepareBatch(_ context.Context, _ string, _ ...driver.PrepareBatchOption) (driver.Batch, error) {
+func (c *fakeConn) PrepareBatch(_ context.Context, query string, _ ...driver.PrepareBatchOption) (driver.Batch, error) {
+	c.query = query
 	if c.prepareErr != nil {
 		return nil, c.prepareErr
 	}
@@ -36,12 +42,21 @@ func (c *fakeConn) Query(_ context.Context, _ string, _ ...any) (driver.Rows, er
 
 type fakeBatch struct {
 	driver.Batch
-	appended int
-	sent     bool
+	appended  int
+	sent      bool
+	aborted   bool
+	appendErr error
 }
 
-func (b *fakeBatch) AppendStruct(any) error { b.appended++; return nil }
-func (b *fakeBatch) Send() error            { b.sent = true; return nil }
+func (b *fakeBatch) AppendStruct(any) error {
+	if b.appendErr != nil {
+		return b.appendErr
+	}
+	b.appended++
+	return nil
+}
+func (b *fakeBatch) Send() error  { b.sent = true; return nil }
+func (b *fakeBatch) Abort() error { b.aborted = true; return nil }
 
 type fakeRows struct {
 	driver.Rows
