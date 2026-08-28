@@ -324,9 +324,13 @@ discarding it is the failure this behaviour exists to prevent.
 | Fields of an embedded struct | Written, spliced in at the embedded field's position |
 | `ch:` tag on the embedded field itself | Error — clickhouse-go flattens the struct and ignores it; tag the inner fields |
 
-Resolving a struct's columns is reflection over its tags only — no query, no
-extra round trip — and the result is cached per type (~60 ns and one allocation
-per `Insert`, against a network round trip).
+Working out the statement is reflection over the struct's tags plus a check
+that `clickhouse-go` can read the column list back — no query to the server, no
+extra round trip. It is cached per type and table, so a batch insert pays
+**~16 ns and no allocations** for it; uncached the same work is ~3.4 µs and 25
+allocations, which is what the cache is worth on a hot path. Recognition
+depends on the table name too, so a caller generating table names adds one
+small entry per name.
 
 #### Upgrading from v0.4.0
 

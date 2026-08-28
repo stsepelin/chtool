@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -45,11 +46,11 @@ func Insert[T any](ctx context.Context, conn Conn, table string, rows []T) error
 	if len(rows) == 0 {
 		return nil
 	}
-	cols, err := columnsFor(rowType[T]())
+	query, cols, err := insertPlan(rowType[T](), table)
 	if err != nil {
 		return fmt.Errorf("insert %s: %w", table, err)
 	}
-	batch, err := conn.PrepareBatch(ctx, insertQuery(table, cols))
+	batch, err := conn.PrepareBatch(ctx, query)
 	if err != nil {
 		return fmt.Errorf("prepare batch %s: %w", table, err)
 	}
@@ -68,6 +69,108 @@ func Insert[T any](ctx context.Context, conn Conn, table string, rows []T) error
 	}
 	return nil
 }
+
+// insertPlan resolves T's columns, renders the statement and confirms
+// clickhouse-go will read the column list back out of it, caching the result
+// per type and table. Recognition depends on the table name as well as the
+// column names, so it cannot be cached on the type alone. Callers usually
+// insert into a fixed handful of tables; a caller generating table names (one
+// per day, say) adds an entry per name, which is small and never invalidated.
+func insertPlan(t reflect.Type, table string) (string, []Column, error) {
+	key := planKey{t, table}
+	if v, ok := planCache.Load(key); ok {
+		p := v.(plan)
+		return p.query, p.cols, p.err
+	}
+	cols, err := columnsFor(t)
+	var query string
+	if err == nil {
+		query = insertQuery(table, cols)
+		err = checkParseable(query, cols)
+	}
+	if err != nil {
+		query, cols = "", nil
+	}
+	planCache.Store(key, plan{query, cols, err})
+	return query, cols, err
+}
+
+type planKey struct {
+	typ   reflect.Type
+	table string
+}
+
+type plan struct {
+	query string
+	cols  []Column
+	err   error
+}
+
+var planCache sync.Map // planKey -> plan
+
+// These mirror how clickhouse-go v2.47 finds the column list in a statement
+// (batch.go). It does that with regexes over the query text rather than by
+// tracking the quoting, and a list it cannot read is not an error to it — it
+// silently resolves the whole table instead. Predicting that here is what lets
+// Insert refuse the statement outright.
+//
+// Reading it back the same way the driver does beats deriving rules about which
+// characters are safe, which is easy to get subtly wrong in both directions.
+// TestIntegrationParseabilityMatchesTheDriver holds the mirror against the real
+// thing, so a dependency bump that changes any of this fails rather than drifts.
+var (
+	chTruncateFormat  = regexp.MustCompile(`(?i)\sFORMAT\s+[^\s]+`)
+	chTruncateValues  = regexp.MustCompile(`\sVALUES\s.*$`)
+	chNormalizeInsert = regexp.MustCompile(`(?i)(?:(?:--[^\n]*|#![^\n]*|#\s[^\n]*)\n\s*)*(INSERT\s+INTO\s+([^(]+)(?:\s*\([^()]*(?:\([^()]*\)[^()]*)*\))?)(?:\s*VALUES)?`)
+	chExtractColumns  = regexp.MustCompile(`(?si)INSERT INTO .+\s\((?P<Columns>.+)\)$`)
+)
+
+// driverColumns returns the column names clickhouse-go would read out of query.
+func driverColumns(query string) []string {
+	q := chTruncateFormat.ReplaceAllString(query, "")
+	q = chTruncateValues.ReplaceAllString(q, "")
+	m := chNormalizeInsert.FindStringSubmatch(q)
+	if len(m) == 0 {
+		return nil
+	}
+	cm := chExtractColumns.FindStringSubmatch(m[1])
+	if len(cm) != 2 {
+		return nil
+	}
+	names := strings.Split(cm[1], ",")
+	for i := range names {
+		names[i] = strings.ReplaceAll(strings.Trim(strings.TrimSpace(names[i]), `"`), "`", "")
+	}
+	return names
+}
+
+// checkParseable refuses a statement whose column list the driver would not read
+// back as written. Leaving it to be noticed later is not enough: when the list
+// is discarded the driver resolves the whole table, which matches what we asked
+// for whenever the struct happens to cover every column — so the insert works
+// until someone adds a column, and then the writer breaks on exactly the
+// migration this package promises is safe.
+func checkParseable(query string, cols []Column) error {
+	got := driverColumns(query)
+	same := len(got) == len(cols)
+	for i := 0; same && i < len(got); i++ {
+		same = got[i] == cols[i].Name
+	}
+	if same {
+		return nil
+	}
+	// Name the column at fault where one can be singled out.
+	for _, c := range cols {
+		if one := driverColumns(insertQuery(table0, []Column{c})); len(one) != 1 || one[0] != c.Name {
+			return fmt.Errorf("column %q (field %s) cannot be named in an INSERT: clickhouse-go reads the column list back out of the statement text, and this name does not survive that, so it would silently write the whole table instead", c.Name, c.Field)
+		}
+	}
+	return fmt.Errorf("the column list is not one clickhouse-go can read back (it would resolve [%s] instead), so the statement would silently write the whole table", strings.Join(got, ", "))
+}
+
+// table0 is a placeholder for testing a single name in isolation, so that a
+// problem with the table name is not blamed on a column.
+const table0 = "t"
 
 // insertQuery renders INSERT INTO table (`a`, `b`).
 func insertQuery(table string, cols []Column) string {

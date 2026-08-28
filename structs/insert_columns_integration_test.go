@@ -475,20 +475,24 @@ func TestIntegrationAwkwardColumnNamesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestIntegrationUnreadableColumnListIsReported uses a name clickhouse-go
-// genuinely cannot read back — an unbalanced parenthesis — against a table with
-// a column the struct does not tag. The driver quietly discards the list and
-// resolves the whole table, which withdraws the DEFAULT guarantee; Insert has
-// to say so rather than fail later on a column nobody named.
-func TestIntegrationUnreadableColumnListIsReported(t *testing.T) {
+// TestIntegrationUnreadableColumnListIsRefusedBeforeAndAfterMigration is the
+// case that makes an up-front refusal necessary rather than a nicety. An
+// unbalanced parenthesis makes clickhouse-go discard the column list and
+// resolve the whole table. While that column is the table's only one, the
+// fallback happens to equal what was asked for and the insert works — so
+// comparing resolved columns alone would let this through, and the writer
+// would break later on exactly the additive migration this package promises is
+// safe. It has to fail the same way on both sides of that migration.
+func TestIntegrationUnreadableColumnListIsRefusedBeforeAndAfterMigration(t *testing.T) {
 	const db = "chtool_it_structs_unreadable"
 	conn, cleanup := scratchConn(t, db)
 	defer cleanup()
 	ctx := context.Background()
 
-	if err := conn.Exec(ctx, "CREATE TABLE "+db+".t ("+
-		"`metric(` Int64, `extra` Int64 DEFAULT 137"+
-		") ENGINE = MergeTree ORDER BY tuple()"); err != nil {
+	// One column, so a discarded list would resolve to exactly what we name.
+	if err := conn.Exec(ctx,
+		"CREATE TABLE "+db+".t (`metric(` Int64) ENGINE = MergeTree ORDER BY tuple()",
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -497,10 +501,80 @@ func TestIntegrationUnreadableColumnListIsReported(t *testing.T) {
 	}
 	err := Insert(ctx, conn, db+".t", []unbalanced{{Metric: 1}})
 	if err == nil {
-		t.Fatal("a column list the driver discarded must be reported, not assumed to have applied")
+		t.Fatal("a name whose column list the driver cannot read must be refused even while the table shape hides it")
 	}
 	if !strings.Contains(err.Error(), "whole table") {
-		t.Errorf("error should explain that the list did not take effect, got: %v", err)
+		t.Errorf("error should explain the consequence, got: %v", err)
+	}
+
+	// The migration that would otherwise have broken the writer.
+	if err := conn.Exec(ctx,
+		"ALTER TABLE "+db+".t ADD COLUMN extra Int64 DEFAULT 137",
+	); err != nil {
+		t.Fatal(err)
+	}
+	after := Insert(ctx, conn, db+".t", []unbalanced{{Metric: 1}})
+	if after == nil {
+		t.Fatal("still unreadable after the migration; must still be refused")
+	}
+	if after.Error() != err.Error() {
+		t.Errorf("the refusal should not depend on the table's shape:\n  before: %v\n  after:  %v", err, after)
+	}
+}
+
+// TestIntegrationParseabilityMatchesTheDriver holds the mirror against the real
+// thing. checkParseable predicts what clickhouse-go will read out of a
+// statement by reproducing how it reads it; this asserts the prediction matches
+// what the driver actually resolves, so a dependency bump that changes any of
+// that fails here instead of drifting out of step unnoticed.
+func TestIntegrationParseabilityMatchesTheDriver(t *testing.T) {
+	const db = "chtool_it_structs_parseable"
+	conn, cleanup := scratchConn(t, db)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i, tc := range parseabilityCases {
+		t.Run(tc.name, func(t *testing.T) {
+			table := fmt.Sprintf("%s.t%d", db, i)
+			// A second column, so a discarded list resolves to more than we name.
+			if err := conn.Exec(ctx, "CREATE TABLE "+table+" (`"+
+				strings.ReplaceAll(tc.name, "`", "")+"` Int64, `extra` Int64 DEFAULT 137"+
+				") ENGINE = MergeTree ORDER BY tuple()"); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+
+			cols := []Column{{Name: tc.name, Field: "Col"}}
+			query := insertQuery(table, cols)
+			predicted := checkParseable(query, cols) == nil
+			if predicted != tc.parseable {
+				t.Fatalf("checkParseable says parseable=%v, case says %v", predicted, tc.parseable)
+			}
+
+			batch, err := conn.PrepareBatch(ctx, query)
+			if err != nil {
+				// A third outcome: the driver truncates the statement at the
+				// stray character and the server rejects what is left. Not
+				// reading the list as written, which is what was predicted —
+				// and a reason to refuse the name rather than let this surface
+				// as "Back quoted string is not closed".
+				if tc.parseable {
+					t.Fatalf("expected the driver to accept this name, got: %v", err)
+				}
+				return
+			}
+			defer batch.Abort() //nolint:errcheck // nothing is appended
+			var resolved []string
+			for _, c := range batch.Columns() {
+				resolved = append(resolved, c.Name())
+			}
+
+			// The driver resolved exactly our list only when it could read it.
+			readBack := len(resolved) == 1 && resolved[0] == tc.name
+			if readBack != tc.parseable {
+				t.Errorf("the driver resolved %v, so parseable=%v, but the case says %v",
+					resolved, readBack, tc.parseable)
+			}
+		})
 	}
 }
 

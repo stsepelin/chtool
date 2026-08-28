@@ -161,21 +161,29 @@ func TestBadTagsDoNotPrepareABatch(t *testing.T) {
 	}
 }
 
-func BenchmarkInsertColumns(b *testing.B) {
+// BenchmarkInsertPlan measures what Insert does before it touches the network:
+// resolve the columns, render the statement and confirm the driver can read it
+// back. All of it is cached per type and table.
+func BenchmarkInsertPlan(b *testing.B) {
 	t := rowType[row]()
 	for b.Loop() {
-		cols, err := columnsFor(t)
-		if err != nil {
+		if _, _, err := insertPlan(t, "analytics.views"); err != nil {
 			b.Fatal(err)
 		}
-		_ = insertQuery("analytics.views", cols)
 	}
 }
 
-func BenchmarkResolveColumnsUncached(b *testing.B) {
+// BenchmarkInsertPlanUncached is the same work with the cache bypassed, which
+// is what the cache is worth per insert.
+func BenchmarkInsertPlanUncached(b *testing.B) {
 	t := rowType[row]()
 	for b.Loop() {
-		if _, err := resolveColumns(t, nil, map[reflect.Type]bool{}); err != nil {
+		cols, err := resolveColumns(t, nil, map[reflect.Type]bool{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		q := insertQuery("analytics.views", cols)
+		if err := checkParseable(q, cols); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -389,5 +397,77 @@ func TestInsertRejectsShadowingFromEmbeddedStruct(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "promoted.Note") {
 		t.Errorf("error should name the shadowing field, got: %v", err)
+	}
+}
+
+// parseabilityCases pairs a column name with whether clickhouse-go can read a
+// list containing it back as written.
+var parseabilityCases = []struct {
+	name      string
+	parseable bool
+}{
+	{"plain", true},
+	{"metric(x)", true},    // balanced; the driver carries its own test for this
+	{"metric(x)(y)", true}, // two groups in sequence
+	{"my col", true},       // a plain space is fine
+	{"my-col", true},
+	{`my"col`, true},
+	{"col.nested", true},
+	{"x values y", true},      // the VALUES clause is stripped case-sensitively
+	{"trailing FORMAT", true}, // no whitespace after it, so no FORMAT clause
+	{"metric((x))", false},    // nested a level deeper than the pattern allows
+	{"metric(", false},        // unbalanced
+	{"metric)", false},        // reads back as "metric"
+	{"x VALUES y", false},
+	{"x FORMAT z", false},
+	{"x format z", false},
+}
+
+// TestInsertRejectsUnparseableNames covers names that leave clickhouse-go
+// unable to read the column list back. These have to be refused when the
+// statement is built, not noticed afterwards: a discarded list resolves the
+// whole table, which matches what was asked for whenever the struct happens to
+// cover every column, so the insert works right up until someone adds one.
+func TestInsertRejectsUnparseableNames(t *testing.T) {
+	for _, tc := range parseabilityCases {
+		if tc.parseable {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			cols := []Column{{Name: tc.name, Field: "Col"}}
+			err := checkParseable(insertQuery("t", cols), cols)
+			if err == nil {
+				t.Fatal("expected refusal")
+			}
+			if !strings.Contains(err.Error(), "whole table") {
+				t.Errorf("error should explain the consequence, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestInsertAcceptsParseableNames(t *testing.T) {
+	for _, tc := range parseabilityCases {
+		if !tc.parseable {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			cols := []Column{{Name: tc.name, Field: "Col"}}
+			if err := checkParseable(insertQuery("t", cols), cols); err != nil {
+				t.Errorf("this name reads back intact and must be accepted: %v", err)
+			}
+		})
+	}
+}
+
+// A table name can break recognition just as a column name can, which is why
+// the check runs on the finished statement rather than on the tags alone.
+func TestInsertRejectsUnparseableTableName(t *testing.T) {
+	err := Insert(context.Background(), &fakeConn{}, "db.evil(", []row{{ID: 1}})
+	if err == nil {
+		t.Fatal("a table name that breaks the column list must be refused")
+	}
+	if !strings.Contains(err.Error(), "whole table") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
