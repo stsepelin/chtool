@@ -273,6 +273,7 @@ type View struct {
 }
 
 // Batch insert (PrepareBatch → AppendStruct → Send); nil/empty is a no-op.
+// Sends: INSERT INTO analytics.views (`id`, `country`, `revenue`, `tags`, `created_at`)
 _ = structs.Insert(ctx, conn, "analytics.views", rows)
 
 // Drift-check the struct against the live table's columns.
@@ -289,10 +290,68 @@ a field whose type can't be inferred and has no `chtype` returns an error.
 
 | Function | Returns |
 |---|---|
-| `Insert[T](ctx, conn, table, rows)` | Batches `rows` into `table` (may be db-qualified) |
+| `Insert[T](ctx, conn, table, rows)` | Batches `rows` into `table` (may be db-qualified), naming its columns |
 | `VerifyTags[T](ctx, conn, db, table)` | `[]Diff` — struct-vs-table column-set mismatches (empty = agree) |
 | `CreateDDL[T](table, engine, orderBy)` | `CREATE TABLE` string |
 | `Columns[T]()` | The reflected `ch:`-tagged columns |
+
+### What an added column costs a consumer
+
+`Insert` names its columns explicitly, so a column the struct does not tag is
+simply left out of the statement and ClickHouse fills it with its `DEFAULT`.
+**Adding a column costs existing writers nothing — no redeploy, no error.** That
+sets the deploy order:
+
+| Change | Safe order |
+|---|---|
+| **Adding** a column | Migrate first. The struct can catch up whenever. |
+| **Dropping** a column | Ship the struct first, then migrate. |
+| **Renaming** a column | Both at once, or add-then-backfill-then-drop. |
+
+The two directions are deliberately not symmetric. An unknown column in the
+table is harmless because ClickHouse has a value for it; a `ch:` tag with no
+column is an error because the field's value has nowhere to go, and silently
+discarding it is the failure this behaviour exists to prevent.
+
+| Struct vs. table | Result |
+|---|---|
+| Column in the table, not tagged | Fine — the server applies its `DEFAULT`, or the type zero |
+| `ch:` tag with no such column | Error from the server (`No such column`) |
+| `ch:` tag on a `MATERIALIZED`/`ALIAS` column | Error — the server computes those and refuses writes |
+| `ch:` tag on an `EPHEMERAL` column | Written — naming it is how a `DEFAULT` that reads it gets a value |
+| Exported field with no `ch` tag | Not written |
+| Untagged field whose Go name equals a tagged column | Error — the driver would fill the column from it instead |
+| Fields of an embedded struct | Written, spliced in at the embedded field's position |
+| `ch:` tag on the embedded field itself | Error — clickhouse-go flattens the struct and ignores it; tag the inner fields |
+
+Working out the statement is reflection over the struct's tags plus a check
+that `clickhouse-go` can read the column list back — no query to the server, no
+extra round trip. It is cached per type and table, so a batch insert pays
+**~16 ns and no allocations** for it; uncached the same work is ~3.4 µs and 25
+allocations, which is what the cache is worth on a hot path. Recognition
+depends on the table name too, so a caller generating table names adds one
+small entry per name.
+
+#### Upgrading from v0.4.0
+
+`Insert` keeps its signature; what changes is that situations it used to
+tolerate silently are now errors. Before bumping, check every struct you pass to
+it for:
+
+1. **`ch:` tags naming columns the table does not have.** These were silently
+   discarded on every insert — that field never reached ClickHouse.
+   `VerifyTags` already reports them as *"in struct but missing from table"*.
+2. **Tags naming `MATERIALIZED` or `ALIAS` columns.** These were ignored before
+   and now fail, because the server computes them and refuses writes. Reads use
+   the same `ch` tag, so a struct shared between reads and writes is the case to
+   look at.
+3. **Exported fields with no `ch` tag whose Go name matches a column.**
+   clickhouse-go matches an untagged field by its Go field name, so the old bare
+   insert wrote it; an explicit list does not, and ClickHouse stores that
+   column's `DEFAULT` instead. Tag them. Where such a field collides with a name
+   a tag already claims, `Insert` refuses rather than filling the column from
+   it. A struct carrying no `ch` tags at all now returns an error rather than
+   inserting by field name.
 
 ---
 
